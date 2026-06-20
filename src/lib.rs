@@ -305,21 +305,198 @@ fn process_dirty(watch_id: i32) -> i64 {
     entries.len() as i64
 }
 
+// ─── index storage ─────────────────────────────────────────────────
+//
+// A row's extraction (its tokens) is stored in the index relation's own
+// pages, WAL-logged through generic WAL, so it is transactional with the
+// heap and travels with physical replication, like pg_search. The cross-
+// row resolved graph (entities/edges) is derived from this. One record
+// per row: [block u32][offset u16][n u16] then n * ([len u16][utf8]).
+
+mod storage {
+    use pgrx::pg_sys;
+
+    const INVALID_OFFSET: u16 = 0;
+    const FIRST_OFFSET: u16 = 1;
+
+    pub fn encode(block: u32, offset: u16, tokens: &[String]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&block.to_le_bytes());
+        v.extend_from_slice(&offset.to_le_bytes());
+        v.extend_from_slice(&(tokens.len() as u16).to_le_bytes());
+        for t in tokens {
+            let b = t.as_bytes();
+            v.extend_from_slice(&(b.len() as u16).to_le_bytes());
+            v.extend_from_slice(b);
+        }
+        v
+    }
+
+    pub fn decode(data: &[u8]) -> (u32, u16, Vec<String>) {
+        let block = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        let offset = u16::from_le_bytes(data[4..6].try_into().unwrap());
+        let n = u16::from_le_bytes(data[6..8].try_into().unwrap()) as usize;
+        let mut pos = 8;
+        let mut tokens = Vec::with_capacity(n);
+        for _ in 0..n {
+            let len = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+            tokens.push(String::from_utf8_lossy(&data[pos..pos + len]).into_owned());
+            pos += len;
+        }
+        (block, offset, tokens)
+    }
+
+    // Index pages are always shared buffers, so the page pointer is a
+    // fixed offset into the shared block array (this is what BufferGetPage
+    // expands to; pgrx does not wrap that inline macro).
+    unsafe fn page(buffer: pg_sys::Buffer) -> pg_sys::Page {
+        pg_sys::BufferBlocks.add((buffer as usize - 1) * pg_sys::BLCKSZ as usize) as pg_sys::Page
+    }
+
+    unsafe fn is_new(page: pg_sys::Page) -> bool {
+        (*(page as *mut pg_sys::PageHeaderData)).pd_upper == 0
+    }
+
+    // Append a record, WAL-logged. Extends the relation when the last page
+    // is full.
+    pub unsafe fn append(indexrel: pg_sys::Relation, data: &[u8]) {
+        let fork = pg_sys::ForkNumber::MAIN_FORKNUM;
+        let nblocks = pg_sys::RelationGetNumberOfBlocksInFork(indexrel, fork);
+        // u32::MAX is P_NEW: extend the relation by a fresh page.
+        let mut block = if nblocks == 0 { u32::MAX } else { nblocks - 1 };
+        loop {
+            let buf = pg_sys::ReadBufferExtended(
+                indexrel,
+                fork,
+                block,
+                pg_sys::ReadBufferMode::RBM_NORMAL,
+                std::ptr::null_mut(),
+            );
+            pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
+            let state = pg_sys::GenericXLogStart(indexrel);
+            let pg = pg_sys::GenericXLogRegisterBuffer(state, buf, 0);
+            if is_new(pg) {
+                pg_sys::PageInit(pg, pg_sys::BLCKSZ as usize, 0);
+            }
+            let off = pg_sys::PageAddItemExtended(
+                pg,
+                data.as_ptr() as pg_sys::Item,
+                data.len(),
+                INVALID_OFFSET,
+                0,
+            );
+            if off == INVALID_OFFSET {
+                pg_sys::GenericXLogAbort(state);
+                pg_sys::UnlockReleaseBuffer(buf);
+                if block == u32::MAX {
+                    pgrx::error!("graphwright: a row's tokens do not fit on one page");
+                }
+                block = u32::MAX; // extend a fresh page and retry
+                continue;
+            }
+            pg_sys::GenericXLogFinish(state);
+            pg_sys::UnlockReleaseBuffer(buf);
+            return;
+        }
+    }
+
+    // Read every live record.
+    pub unsafe fn scan(indexrel: pg_sys::Relation) -> Vec<Vec<u8>> {
+        let fork = pg_sys::ForkNumber::MAIN_FORKNUM;
+        let nblocks = pg_sys::RelationGetNumberOfBlocksInFork(indexrel, fork);
+        let mut out = Vec::new();
+        for blk in 0..nblocks {
+            let buf = pg_sys::ReadBufferExtended(
+                indexrel,
+                fork,
+                blk,
+                pg_sys::ReadBufferMode::RBM_NORMAL,
+                std::ptr::null_mut(),
+            );
+            pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
+            let pg = page(buf);
+            if !is_new(pg) {
+                let maxoff = pg_sys::PageGetMaxOffsetNumber(pg);
+                let mut off = FIRST_OFFSET;
+                while off <= maxoff {
+                    let iid = pg_sys::PageGetItemId(pg, off);
+                    if (*iid).lp_flags() == pg_sys::LP_NORMAL {
+                        let item = pg_sys::PageGetItem(pg, iid) as *const u8;
+                        let len = (*iid).lp_len() as usize;
+                        out.push(std::slice::from_raw_parts(item, len).to_vec());
+                    }
+                    off += 1;
+                }
+            }
+            pg_sys::UnlockReleaseBuffer(buf);
+        }
+        out
+    }
+}
+
+// Open an index by name, read back its stored per-row tokens. Lets a test
+// confirm the data really lives in index storage.
+fn index_dump(index: &str) -> Vec<(String, Vec<Option<String>>)> {
+    let oid = pgrx::Spi::get_one::<pg_sys::Oid>(&format!("SELECT {}::regclass::oid", lit(index)))
+        .expect("index oid")
+        .expect("index oid");
+    let mut out = Vec::new();
+    unsafe {
+        let rel = pg_sys::relation_open(oid, pg_sys::AccessShareLock as i32);
+        for rec in storage::scan(rel) {
+            let (block, offset, tokens) = storage::decode(&rec);
+            out.push((
+                format!("({block},{offset})"),
+                tokens.into_iter().map(Some).collect(),
+            ));
+        }
+        pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+    }
+    out
+}
+
 // ─── index access method ───────────────────────────────────────────
 //
 // `CREATE INDEX ... USING graphwright (body)` registers the table's text
-// column as a watch (with ctid provenance) and builds the graph. The
-// index stores nothing of its own; the graph lives in the catalog tables
-// and is queried through the RLS-aware accessors. Incremental aminsert /
-// ambulkdelete are no-ops for now (rebuild on REINDEX); live maintenance
-// is the next milestone (a background worker off a change queue).
+// column as a watch (ctid provenance), writes each row's tokens into the
+// index's own storage (the native, WAL-logged path), and builds the
+// resolved graph in the catalog tables. The accessors query the graph and
+// filter it by RLS. Incremental aminsert / ambulkdelete are no-ops for
+// now; the change queue keeps the resolved graph current.
 
 use core::ffi::{c_int, c_void};
+
+struct BuildState {
+    indexrel: pg_sys::Relation,
+    ntuples: f64,
+}
+
+// Per-row build callback: tokenize the indexed column and store the
+// tokens in the index relation's pages, keyed by heap ctid.
+#[pg_guard]
+unsafe extern "C-unwind" fn build_callback(
+    _index: pg_sys::Relation,
+    tid: pg_sys::ItemPointer,
+    values: *mut pg_sys::Datum,
+    isnull: *mut bool,
+    _tuple_is_alive: bool,
+    state: *mut c_void,
+) {
+    use pgrx::datum::FromDatum;
+    let st = &mut *(state as *mut BuildState);
+    let body = String::from_datum(*values, *isnull).unwrap_or_default();
+    let tokens = tokenize(&body);
+    let block = (((*tid).ip_blkid.bi_hi as u32) << 16) | (*tid).ip_blkid.bi_lo as u32;
+    let offset = (*tid).ip_posid;
+    storage::append(st.indexrel, &storage::encode(block, offset, &tokens));
+    st.ntuples += 1.0;
+}
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn ambuild(
     heaprel: pg_sys::Relation,
-    _indexrel: pg_sys::Relation,
+    indexrel: pg_sys::Relation,
     index_info: *mut pg_sys::IndexInfo,
 ) -> *mut pg_sys::IndexBuildResult {
     let attnum = (*index_info).ii_IndexAttrNumbers[0];
@@ -338,9 +515,25 @@ pub unsafe extern "C-unwind" fn ambuild(
     let watch_id = upsert_watch(&table, &column, "ctid");
     let n = rebuild(watch_id);
 
+    // Native path: store each row's tokens in the index's own storage.
+    let mut st = BuildState {
+        indexrel,
+        ntuples: 0.0,
+    };
+    pg_sys::table_index_build_scan(
+        heaprel,
+        indexrel,
+        index_info,
+        true,
+        false,
+        Some(build_callback),
+        &mut st as *mut _ as *mut c_void,
+        std::ptr::null_mut(),
+    );
+
     let mut result = pgrx::PgBox::<pg_sys::IndexBuildResult>::alloc0();
     result.heap_tuples = n as f64;
-    result.index_tuples = n as f64;
+    result.index_tuples = st.ntuples;
     result.into_pg()
 }
 
@@ -682,6 +875,15 @@ GRANT SELECT ON ALL TABLES IN SCHEMA graphwright TO PUBLIC;
         drain_all()
     }
 
+    // Read a graphwright index's per-row tokens back from its own storage.
+    // Diagnostic: confirms the extraction lives in index pages.
+    #[pg_extern]
+    fn index_dump(
+        index: &str,
+    ) -> TableIterator<'static, (name!(ctid, String), name!(tokens, Vec<Option<String>>))> {
+        TableIterator::new(super::index_dump(index))
+    }
+
     // Entities visible to the caller: those mentioned by at least one
     // source row the caller can read. The EXISTS probe joins the source
     // table, so RLS filters it.
@@ -978,6 +1180,38 @@ mod tests {
             .unwrap();
         assert!(applied >= 1);
         assert_eq!(all_entities(), vec!["sara", "tehran"]);
+    }
+
+    // The per-row extraction is stored in the index relation's own pages
+    // (WAL-logged), and reads back from there.
+    #[pg_test]
+    fn tokens_live_in_index_storage() {
+        Spi::run("CREATE TABLE notes (id int PRIMARY KEY, owner text, body text)").unwrap();
+        Spi::run("INSERT INTO notes VALUES (1, 'amir', 'Sara Tehran'), (2, 'amir', 'Reza Berlin')")
+            .unwrap();
+        Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+
+        let rows = Spi::connect(|client| {
+            let table = client.select(
+                "SELECT array_to_string(tokens, ',') FROM graphwright.index_dump('notes_kg') ORDER BY 1",
+                None,
+                &[],
+            )?;
+            let mut v = Vec::new();
+            for row in table {
+                v.push(row.get::<String>(1)?.unwrap());
+            }
+            Ok::<_, pgrx::spi::Error>(v)
+        })
+        .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .any(|s| s.contains("sara") && s.contains("tehran")));
+        assert!(rows
+            .iter()
+            .any(|s| s.contains("reza") && s.contains("berlin")));
     }
 }
 
