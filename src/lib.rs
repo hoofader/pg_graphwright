@@ -84,7 +84,8 @@ fn watch_meta(source_table: &str) -> WatchMeta {
 // Register (or update) a watch and return its id. The index AM passes
 // pk_column = "ctid", which the RLS accessors then probe as `(s.ctid)::text`.
 fn upsert_watch(source_table: &str, text_column: &str, pk_column: &str) -> i32 {
-    let sql = format!(
+    use pgrx::Spi;
+    let id = Spi::get_one::<i32>(&format!(
         "INSERT INTO graphwright.watch (source_table, text_column, pk_column) \
          VALUES ({}::regclass, {}, {}) \
          ON CONFLICT (source_table, text_column) \
@@ -93,10 +94,24 @@ fn upsert_watch(source_table: &str, text_column: &str, pk_column: &str) -> i32 {
         lit(source_table),
         lit(text_column),
         lit(pk_column),
-    );
-    pgrx::Spi::get_one::<i32>(&sql)
-        .expect("watch insert")
-        .expect("watch id")
+    ))
+    .expect("watch insert")
+    .expect("watch id");
+
+    // Install the capture trigger so row changes queue for process_dirty.
+    // CREATE OR REPLACE keeps it idempotent across rebuilds.
+    let table = Spi::get_one::<String>(&format!(
+        "SELECT source_table::text FROM graphwright.watch WHERE id = {id}"
+    ))
+    .expect("watch table")
+    .expect("watch table");
+    Spi::run(&format!(
+        "CREATE OR REPLACE TRIGGER graphwright_capture \
+         AFTER INSERT OR UPDATE OR DELETE ON {table} \
+         FOR EACH ROW EXECUTE FUNCTION graphwright._enqueue()"
+    ))
+    .expect("install capture trigger");
+    id
 }
 
 // The stub extractor, shared by reindex() and the index AM's build: each
@@ -139,51 +154,155 @@ fn rebuild(watch_id: i32) -> i64 {
         "DELETE FROM graphwright.entity WHERE watch_id = {watch_id}"
     ))
     .expect("clear watch");
+    Spi::run(&format!(
+        "DELETE FROM graphwright.dirty WHERE watch_id = {watch_id}"
+    ))
+    .expect("clear queue");
 
     let mut mentions = 0i64;
     for (pk, body) in &rows {
-        let mut ids: Vec<i64> = Vec::new();
-        for tok in tokenize(body) {
-            let entity_id = Spi::get_one::<i64>(&format!(
-                "INSERT INTO graphwright.entity (watch_id, surface) VALUES ({watch_id}, {surf}) \
-                 ON CONFLICT (watch_id, surface) DO UPDATE SET surface = EXCLUDED.surface \
-                 RETURNING id",
-                surf = lit(&tok),
-            ))
-            .expect("entity upsert")
-            .expect("entity id");
-            Spi::run(&format!(
-                "INSERT INTO graphwright.mention (watch_id, entity_id, source_pk, surface_form) \
-                 VALUES ({watch_id}, {entity_id}, {pk}, {sf})",
-                pk = lit(pk),
-                sf = lit(&tok),
-            ))
-            .expect("mention insert");
-            mentions += 1;
-            ids.push(entity_id);
-        }
-        for pair in ids.windows(2) {
-            let (a, b) = (pair[0], pair[1]);
-            if a == b {
-                continue;
-            }
-            let (src, dst) = if a < b { (a, b) } else { (b, a) };
-            let edge_id = Spi::get_one::<i64>(&format!(
-                "INSERT INTO graphwright.edge (watch_id, src, dst) VALUES ({watch_id}, {src}, {dst}) \
-                 ON CONFLICT (watch_id, src, dst, predicate) DO UPDATE SET predicate = EXCLUDED.predicate \
-                 RETURNING id",
-            ))
-            .expect("edge upsert")
-            .expect("edge id");
-            Spi::run(&format!(
-                "INSERT INTO graphwright.edge_support (edge_id, source_pk) VALUES ({edge_id}, {pk}) \
-                 ON CONFLICT DO NOTHING",
-                pk = lit(pk),
-            ))
-            .expect("edge support");
-        }
+        mentions += index_row(watch_id, pk, body);
     }
     mentions
+}
+
+// Add one row's contribution: entities, mentions, and co-mention edges,
+// each tagged with the row's provenance. Returns the mention count.
+fn index_row(watch_id: i32, source_pk: &str, body: &str) -> i64 {
+    use pgrx::Spi;
+    let mut ids: Vec<i64> = Vec::new();
+    let mut mentions = 0i64;
+    for tok in tokenize(body) {
+        let entity_id = Spi::get_one::<i64>(&format!(
+            "INSERT INTO graphwright.entity (watch_id, surface) VALUES ({watch_id}, {surf}) \
+             ON CONFLICT (watch_id, surface) DO UPDATE SET surface = EXCLUDED.surface \
+             RETURNING id",
+            surf = lit(&tok),
+        ))
+        .expect("entity upsert")
+        .expect("entity id");
+        Spi::run(&format!(
+            "INSERT INTO graphwright.mention (watch_id, entity_id, source_pk, surface_form) \
+             VALUES ({watch_id}, {entity_id}, {pk}, {sf})",
+            pk = lit(source_pk),
+            sf = lit(&tok),
+        ))
+        .expect("mention insert");
+        mentions += 1;
+        ids.push(entity_id);
+    }
+    for pair in ids.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if a == b {
+            continue;
+        }
+        let (src, dst) = if a < b { (a, b) } else { (b, a) };
+        let edge_id = Spi::get_one::<i64>(&format!(
+            "INSERT INTO graphwright.edge (watch_id, src, dst) VALUES ({watch_id}, {src}, {dst}) \
+             ON CONFLICT (watch_id, src, dst, predicate) DO UPDATE SET predicate = EXCLUDED.predicate \
+             RETURNING id",
+        ))
+        .expect("edge upsert")
+        .expect("edge id");
+        Spi::run(&format!(
+            "INSERT INTO graphwright.edge_support (edge_id, source_pk) VALUES ({edge_id}, {pk}) \
+             ON CONFLICT DO NOTHING",
+            pk = lit(source_pk),
+        ))
+        .expect("edge support");
+    }
+    mentions
+}
+
+// Remove one row's contribution, dropping any entity or edge that loses
+// its last support.
+fn remove_row(watch_id: i32, source_pk: &str) {
+    use pgrx::Spi;
+    let p = lit(source_pk);
+    Spi::run(&format!(
+        "DELETE FROM graphwright.edge_support WHERE source_pk = {p} \
+         AND edge_id IN (SELECT id FROM graphwright.edge WHERE watch_id = {watch_id})"
+    ))
+    .expect("drop edge support");
+    Spi::run(&format!(
+        "DELETE FROM graphwright.edge e WHERE e.watch_id = {watch_id} \
+         AND NOT EXISTS (SELECT 1 FROM graphwright.edge_support s WHERE s.edge_id = e.id)"
+    ))
+    .expect("drop unsupported edges");
+    Spi::run(&format!(
+        "DELETE FROM graphwright.mention WHERE watch_id = {watch_id} AND source_pk = {p}"
+    ))
+    .expect("drop mentions");
+    Spi::run(&format!(
+        "DELETE FROM graphwright.entity en WHERE en.watch_id = {watch_id} \
+         AND NOT EXISTS (SELECT 1 FROM graphwright.mention m WHERE m.entity_id = en.id)"
+    ))
+    .expect("drop orphan entities");
+}
+
+// Re-extract a single source row by its ctid, if it still exists.
+fn add_row(watch_id: i32, source_pk: &str) {
+    use pgrx::Spi;
+    let (source_table, text_column, pk_column) = Spi::get_three::<String, String, String>(&format!(
+        "SELECT source_table::text, text_column, pk_column FROM graphwright.watch WHERE id = {watch_id}"
+    ))
+    .expect("watch lookup");
+    let source_table = source_table.expect("source table");
+    let text_column = text_column.expect("text column");
+    let pk_column = pk_column.expect("pk column");
+    let body = Spi::get_one::<String>(&format!(
+        "SELECT ({txt})::text FROM {tbl} WHERE ({pk})::text = {p}",
+        txt = ident(&text_column),
+        tbl = source_table,
+        pk = ident(&pk_column),
+        p = lit(source_pk),
+    ))
+    .expect("read row");
+    if let Some(body) = body {
+        index_row(watch_id, source_pk, &body);
+    }
+}
+
+// Drain the change queue for a watch, applying each queued change. Each
+// entry is removed first (idempotent), then re-added for an upsert.
+fn process_dirty(watch_id: i32) -> i64 {
+    use pgrx::Spi;
+    let entries: Vec<(i64, String, String)> = Spi::connect(|client| {
+        let table = client.select(
+            &format!(
+                "SELECT id, source_pk, op FROM graphwright.dirty \
+                 WHERE watch_id = {watch_id} ORDER BY id"
+            ),
+            None,
+            &[],
+        )?;
+        let mut out = Vec::new();
+        for row in table {
+            out.push((
+                row.get::<i64>(1)?.expect("dirty id"),
+                row.get::<String>(2)?.expect("source pk"),
+                row.get::<String>(3)?.expect("op"),
+            ));
+        }
+        Ok::<_, pgrx::spi::Error>(out)
+    })
+    .expect("read queue");
+
+    if entries.is_empty() {
+        return 0;
+    }
+    let max_id = entries.iter().map(|(id, _, _)| *id).max().unwrap_or(0);
+    for (_, pk, op) in &entries {
+        remove_row(watch_id, pk);
+        if op == "upsert" {
+            add_row(watch_id, pk);
+        }
+    }
+    Spi::run(&format!(
+        "DELETE FROM graphwright.dirty WHERE watch_id = {watch_id} AND id <= {max_id}"
+    ))
+    .expect("clear processed");
+    entries.len() as i64
 }
 
 // ─── index access method ───────────────────────────────────────────
@@ -404,6 +523,43 @@ CREATE TABLE graphwright.edge_support (
     PRIMARY KEY (edge_id, source_pk)
 );
 
+-- Change queue: the capture trigger records which source rows are dirty
+-- (ctid + op); process_dirty drains it and applies the changes.
+CREATE TABLE graphwright.dirty (
+    id        bigserial PRIMARY KEY,
+    watch_id  integer NOT NULL REFERENCES graphwright.watch(id) ON DELETE CASCADE,
+    source_pk text NOT NULL,
+    op        text NOT NULL CHECK (op IN ('upsert', 'delete'))
+);
+
+-- The capture trigger. SECURITY DEFINER so a writer who lacks rights on
+-- the queue can still enqueue. Names are schema-qualified, so the
+-- definer's search_path does not matter.
+CREATE FUNCTION graphwright._enqueue() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER AS $enqueue$
+BEGIN
+    -- Provenance is the watch's pk column. The index path uses 'ctid' (a
+    -- system column, absent from row_to_json), so it is read directly.
+    IF TG_OP <> 'DELETE' THEN
+        INSERT INTO graphwright.dirty (watch_id, source_pk, op)
+        SELECT w.id,
+               CASE WHEN w.pk_column = 'ctid' THEN NEW.ctid::text
+                    ELSE row_to_json(NEW) ->> w.pk_column END,
+               'upsert'
+        FROM graphwright.watch w WHERE w.source_table = TG_RELID;
+    END IF;
+    IF TG_OP <> 'INSERT' THEN
+        INSERT INTO graphwright.dirty (watch_id, source_pk, op)
+        SELECT w.id,
+               CASE WHEN w.pk_column = 'ctid' THEN OLD.ctid::text
+                    ELSE row_to_json(OLD) ->> w.pk_column END,
+               'delete'
+        FROM graphwright.watch w WHERE w.source_table = TG_RELID;
+    END IF;
+    RETURN NULL;
+END;
+$enqueue$;
+
 -- M1a exposes the graph only through the RLS-aware accessors, but those
 -- run as the caller (SECURITY INVOKER), so the caller needs read access
 -- to the catalog. Locking the catalog down (so the accessors are the
@@ -427,6 +583,14 @@ GRANT SELECT ON ALL TABLES IN SCHEMA graphwright TO PUBLIC;
     #[pg_extern]
     fn reindex(watch_id: i32) -> i64 {
         super::rebuild(watch_id)
+    }
+
+    // Apply queued row changes to the graph. A background worker calls
+    // this on an interval; you can also call it directly. Returns the
+    // number of queued changes applied.
+    #[pg_extern]
+    fn process_dirty(watch_id: i32) -> i64 {
+        super::process_dirty(watch_id)
     }
 
     // Entities visible to the caller: those mentioned by at least one
@@ -656,6 +820,58 @@ mod tests {
         assert!(a.contains(&("sara".into(), "tehran".into())));
         assert!(a.contains(&("berlin".into(), "reza".into())));
         assert_eq!(edges_as("role_b"), vec![("sara".into(), "berlin".into())]);
+    }
+
+    // The whole graph, unfiltered (the test runs as superuser, which
+    // bypasses RLS, so the probe sees every row).
+    fn all_entities() -> Vec<String> {
+        Spi::connect(|client| {
+            let table = client.select(
+                "SELECT surface FROM graphwright.entities('notes') ORDER BY surface",
+                None,
+                &[],
+            )?;
+            let mut v = Vec::new();
+            for row in table {
+                v.push(row.get::<String>(1)?.unwrap());
+            }
+            Ok::<_, pgrx::spi::Error>(v)
+        })
+        .unwrap()
+    }
+
+    // The capture trigger queues row changes; process_dirty applies them.
+    #[pg_test]
+    fn live_maintenance_applies_inserts_updates_deletes() {
+        Spi::run("CREATE TABLE notes (id int PRIMARY KEY, owner text, body text)").unwrap();
+        Spi::run("INSERT INTO notes VALUES (1, 'amir', 'Sara Tehran')").unwrap();
+        Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+        let wid = Spi::get_one::<i32>(
+            "SELECT id FROM graphwright.watch WHERE source_table = 'notes'::regclass",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(all_entities(), vec!["sara", "tehran"]);
+
+        // INSERT: the trigger queues it, process_dirty adds it.
+        Spi::run("INSERT INTO notes VALUES (2, 'amir', 'Reza Berlin')").unwrap();
+        Spi::run(&format!("SELECT graphwright.process_dirty({wid})")).unwrap();
+        assert_eq!(all_entities(), vec!["berlin", "reza", "sara", "tehran"]);
+
+        // UPDATE: the old row's contribution is removed, the new one added.
+        Spi::run("UPDATE notes SET body = 'Sara Paris' WHERE id = 1").unwrap();
+        Spi::run(&format!("SELECT graphwright.process_dirty({wid})")).unwrap();
+        let updated = all_entities();
+        assert!(updated.contains(&"paris".to_string()));
+        assert!(!updated.contains(&"tehran".to_string())); // only row 1 had it
+
+        // DELETE: the row's contribution is removed.
+        Spi::run("DELETE FROM notes WHERE id = 2").unwrap();
+        Spi::run(&format!("SELECT graphwright.process_dirty({wid})")).unwrap();
+        let deleted = all_entities();
+        assert!(!deleted.contains(&"reza".to_string()));
+        assert!(!deleted.contains(&"berlin".to_string()));
+        assert_eq!(deleted, vec!["paris", "sara"]);
     }
 }
 
