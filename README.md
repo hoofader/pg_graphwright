@@ -65,4 +65,4 @@ Requires the pgrx toolchain (`cargo install cargo-pgrx`, then `cargo pgrx init`)
 
 ## License
 
-Apache-2.0
+AGPL-3.0-only. See [LICENSE](LICENSE).

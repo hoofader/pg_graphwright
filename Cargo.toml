@@ -3,7 +3,7 @@ name = "pg_graphwright"
 version = "0.1.0"
 edition = "2021"
 description = "A Postgres extension that maintains a row-level-security-aware knowledge-graph index over documents."
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 authors = ["Hoofader <info@hoofade.com>"]
 repository = "https://github.com/hoofader/pg_graphwright"
 
