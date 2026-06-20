@@ -475,9 +475,90 @@ fn graphwright_amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> pgrx::PgBox<pg_sy
     amroutine.into_pg_boxed()
 }
 
+// ─── background maintenance worker ──────────────────────────────────
+//
+// Drains the change queue for every watch on an interval, so the graph
+// stays current without anyone calling process_dirty. It connects to one
+// database (the graphwright.database GUC), so it needs that set plus
+// shared_preload_libraries = 'pg_graphwright'. graphwright.maintain()
+// runs the same drain on demand (e.g. from pg_cron) without the worker.
+
+use pgrx::bgworkers::{
+    BackgroundWorker, BackgroundWorkerBuilder, BgWorkerStartTime, SignalWakeFlags,
+};
+use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
+use std::ffi::CString;
+use std::time::Duration;
+
+static MAINTENANCE_DATABASE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+
+// Apply queued changes for every watch that has any. Returns the total
+// number of changes applied.
+fn drain_all() -> i64 {
+    use pgrx::Spi;
+    if Spi::get_one::<bool>("SELECT to_regnamespace('graphwright') IS NOT NULL")
+        .ok()
+        .flatten()
+        != Some(true)
+    {
+        return 0;
+    }
+    let watch_ids: Vec<i32> = Spi::connect(|client| {
+        let table = client.select("SELECT DISTINCT watch_id FROM graphwright.dirty", None, &[])?;
+        let mut v = Vec::new();
+        for row in table {
+            v.push(row.get::<i32>(1)?.expect("watch id"));
+        }
+        Ok::<_, pgrx::spi::Error>(v)
+    })
+    .unwrap_or_default();
+    watch_ids.into_iter().map(process_dirty).sum()
+}
+
+#[pg_guard]
+pub extern "C-unwind" fn _PG_init() {
+    GucRegistry::define_string_guc(
+        c"graphwright.database",
+        c"Database the maintenance worker keeps current.",
+        c"Empty disables the worker. Also needs shared_preload_libraries = 'pg_graphwright'.",
+        &MAINTENANCE_DATABASE,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+    // Registering a background worker is only valid during preload.
+    if unsafe { !pg_sys::process_shared_preload_libraries_in_progress } {
+        return;
+    }
+    BackgroundWorkerBuilder::new("graphwright maintenance")
+        .set_function("graphwright_maintenance_worker")
+        .set_library("pg_graphwright")
+        .enable_spi_access()
+        .set_start_time(BgWorkerStartTime::RecoveryFinished)
+        .load();
+}
+
+#[pg_guard]
+#[no_mangle]
+pub extern "C-unwind" fn graphwright_maintenance_worker(_arg: pg_sys::Datum) {
+    let database = match MAINTENANCE_DATABASE.get() {
+        Some(d) if !d.to_string_lossy().is_empty() => d.to_string_lossy().into_owned(),
+        _ => return, // no database configured; nothing to maintain
+    };
+    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+    BackgroundWorker::connect_worker_to_spi(Some(&database), None);
+    while BackgroundWorker::wait_latch(Some(Duration::from_secs(10))) {
+        if BackgroundWorker::sigterm_received() {
+            break;
+        }
+        BackgroundWorker::transaction(|| {
+            drain_all();
+        });
+    }
+}
+
 #[pg_schema]
 mod graphwright {
-    use super::{ident, watch_meta, Visibility};
+    use super::{drain_all, ident, watch_meta, Visibility};
     use pgrx::prelude::*;
 
     // Catalog lives inside the schema module so pgrx orders it after the
@@ -591,6 +672,14 @@ GRANT SELECT ON ALL TABLES IN SCHEMA graphwright TO PUBLIC;
     #[pg_extern]
     fn process_dirty(watch_id: i32) -> i64 {
         super::process_dirty(watch_id)
+    }
+
+    // Drain the change queue for every watch (what the background worker
+    // does each tick). Returns the number of changes applied. Call it
+    // from pg_cron, or let the worker call it on an interval.
+    #[pg_extern]
+    fn maintain() -> i64 {
+        drain_all()
     }
 
     // Entities visible to the caller: those mentioned by at least one
@@ -872,6 +961,23 @@ mod tests {
         assert!(!deleted.contains(&"reza".to_string()));
         assert!(!deleted.contains(&"berlin".to_string()));
         assert_eq!(deleted, vec!["paris", "sara"]);
+    }
+
+    // graphwright.maintain() drains every watch (the background worker's
+    // per-tick body, exercised synchronously here).
+    #[pg_test]
+    fn maintain_drains_every_watch() {
+        Spi::run("CREATE TABLE notes (id int PRIMARY KEY, owner text, body text)").unwrap();
+        Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+        // Insert after the (empty) build; the change is only queued.
+        Spi::run("INSERT INTO notes VALUES (1, 'amir', 'Sara Tehran')").unwrap();
+        assert!(all_entities().is_empty());
+
+        let applied = Spi::get_one::<i64>("SELECT graphwright.maintain()")
+            .unwrap()
+            .unwrap();
+        assert!(applied >= 1);
+        assert_eq!(all_entities(), vec!["sara", "tehran"]);
     }
 }
 

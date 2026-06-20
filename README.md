@@ -8,9 +8,8 @@ This is the Postgres-native sibling of [graphwright](https://github.com/hoofader
 
 ## Status
 
-Early. The data model, the RLS-aware query surface, and a real index access method are in place and proven end to end. `CREATE INDEX ... USING graphwright (body)` builds the graph; the accessors filter it per user against the source table's RLS. Extraction is still a deterministic stub (tokenize a row, co-mention edges). The pieces still to come:
+Early. The data model, the RLS-aware query surface, a real index access method, and live maintenance are in place and proven end to end. `CREATE INDEX ... USING graphwright (body)` builds the graph; a change trigger keeps it current as rows are inserted, updated, and deleted; the accessors filter it per user against the source table's RLS. Extraction is still a deterministic stub (tokenize a row, co-mention edges). The pieces still to come:
 
-- incremental maintenance: `aminsert` / `ambulkdelete` are no-ops for now, so the graph is built at `CREATE INDEX` / `REINDEX` time. A background worker off a change queue is next.
 - a real extraction seam (a local LLM / GLiNER via graphwright-onnx, judged by a larger model),
 - the resolution cascade (phonetic, fuzzy, embedding) ported from the graphwright core,
 - a human-in-the-loop review queue (proposals an operator accepts or rejects),
@@ -53,6 +52,25 @@ An edge can be supported by more than one source row. Two rules, set per watch (
 UPDATE graphwright.watch SET visibility = 'intersection'
   WHERE source_table = 'notes'::regclass;
 ```
+
+## Live maintenance
+
+`CREATE INDEX` installs a trigger that records every changed row into a change queue (`graphwright.dirty`). Draining the queue applies the changes incrementally, dropping any entity or edge that loses its last supporting row. Drain it whichever way fits:
+
+```sql
+SELECT graphwright.maintain();           -- drain every watch now (e.g. from pg_cron)
+SELECT graphwright.process_dirty(1);     -- or one watch
+```
+
+For a worker that drains automatically, preload the library and name the database:
+
+```
+# postgresql.conf
+shared_preload_libraries = 'pg_graphwright'
+graphwright.database = 'mydb'
+```
+
+Extraction is a fast stub today, so draining is cheap. When it becomes LLM-backed, the queue is what keeps the work off the writing transaction.
 
 ## Build
 
