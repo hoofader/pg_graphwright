@@ -84,8 +84,7 @@ fn watch_meta(source_table: &str) -> WatchMeta {
 // Register (or update) a watch and return its id. The index AM passes
 // pk_column = "ctid", which the RLS accessors then probe as `(s.ctid)::text`.
 fn upsert_watch(source_table: &str, text_column: &str, pk_column: &str) -> i32 {
-    use pgrx::Spi;
-    let id = Spi::get_one::<i32>(&format!(
+    pgrx::Spi::get_one::<i32>(&format!(
         "INSERT INTO graphwright.watch (source_table, text_column, pk_column) \
          VALUES ({}::regclass, {}, {}) \
          ON CONFLICT (source_table, text_column) \
@@ -96,12 +95,15 @@ fn upsert_watch(source_table: &str, text_column: &str, pk_column: &str) -> i32 {
         lit(pk_column),
     ))
     .expect("watch insert")
-    .expect("watch id");
+    .expect("watch id")
+}
 
-    // Install the capture trigger so row changes queue for process_dirty.
-    // CREATE OR REPLACE keeps it idempotent across rebuilds.
+// Install the change-capture trigger on a watch's table (the no-index
+// path; the index path captures changes in aminsert instead).
+fn install_capture_trigger(watch_id: i32) {
+    use pgrx::Spi;
     let table = Spi::get_one::<String>(&format!(
-        "SELECT source_table::text FROM graphwright.watch WHERE id = {id}"
+        "SELECT source_table::text FROM graphwright.watch WHERE id = {watch_id}"
     ))
     .expect("watch table")
     .expect("watch table");
@@ -111,7 +113,22 @@ fn upsert_watch(source_table: &str, text_column: &str, pk_column: &str) -> i32 {
          FOR EACH ROW EXECUTE FUNCTION graphwright._enqueue()"
     ))
     .expect("install capture trigger");
-    id
+}
+
+// Clear a watch's resolved graph, then resolve it from the per-row tokens
+// stored in the index relation. This makes index storage the source of
+// truth for the index path.
+fn resolve_from_storage(indexrel: pg_sys::Relation, watch_id: i32) {
+    use pgrx::Spi;
+    Spi::run(&format!(
+        "DELETE FROM graphwright.entity WHERE watch_id = {watch_id}"
+    ))
+    .expect("clear watch");
+    let records = unsafe { storage::scan(indexrel) };
+    for rec in &records {
+        let (block, offset, tokens) = storage::decode(rec);
+        resolve_tokens(watch_id, &format!("({block},{offset})"), &tokens);
+    }
 }
 
 // The stub extractor, shared by reindex() and the index AM's build: each
@@ -166,18 +183,25 @@ fn rebuild(watch_id: i32) -> i64 {
     mentions
 }
 
-// Add one row's contribution: entities, mentions, and co-mention edges,
-// each tagged with the row's provenance. Returns the mention count.
+// Add one row's contribution from its source text (tokenize, then
+// resolve). Used by the no-index reindex path.
 fn index_row(watch_id: i32, source_pk: &str, body: &str) -> i64 {
+    resolve_tokens(watch_id, source_pk, &tokenize(body))
+}
+
+// Resolve a row's already-extracted tokens into entities, mentions, and
+// co-mention edges, tagged with the row's provenance. The index path
+// feeds tokens read from index storage; the reindex path tokenizes first.
+fn resolve_tokens(watch_id: i32, source_pk: &str, tokens: &[String]) -> i64 {
     use pgrx::Spi;
     let mut ids: Vec<i64> = Vec::new();
     let mut mentions = 0i64;
-    for tok in tokenize(body) {
+    for tok in tokens {
         let entity_id = Spi::get_one::<i64>(&format!(
             "INSERT INTO graphwright.entity (watch_id, surface) VALUES ({watch_id}, {surf}) \
              ON CONFLICT (watch_id, surface) DO UPDATE SET surface = EXCLUDED.surface \
              RETURNING id",
-            surf = lit(&tok),
+            surf = lit(tok),
         ))
         .expect("entity upsert")
         .expect("entity id");
@@ -185,7 +209,7 @@ fn index_row(watch_id: i32, source_pk: &str, body: &str) -> i64 {
             "INSERT INTO graphwright.mention (watch_id, entity_id, source_pk, surface_form) \
              VALUES ({watch_id}, {entity_id}, {pk}, {sf})",
             pk = lit(source_pk),
-            sf = lit(&tok),
+            sf = lit(tok),
         ))
         .expect("mention insert");
         mentions += 1;
@@ -513,9 +537,9 @@ pub unsafe extern "C-unwind" fn ambuild(
             .expect("table name")
             .expect("table name");
     let watch_id = upsert_watch(&table, &column, "ctid");
-    let n = rebuild(watch_id);
 
-    // Native path: store each row's tokens in the index's own storage.
+    // Store each row's tokens in the index's own storage, then resolve the
+    // graph from that storage (not from the source rows).
     let mut st = BuildState {
         indexrel,
         ntuples: 0.0,
@@ -530,9 +554,10 @@ pub unsafe extern "C-unwind" fn ambuild(
         &mut st as *mut _ as *mut c_void,
         std::ptr::null_mut(),
     );
+    resolve_from_storage(indexrel, watch_id);
 
     let mut result = pgrx::PgBox::<pg_sys::IndexBuildResult>::alloc0();
-    result.heap_tuples = n as f64;
+    result.heap_tuples = st.ntuples;
     result.index_tuples = st.ntuples;
     result.into_pg()
 }
@@ -540,19 +565,25 @@ pub unsafe extern "C-unwind" fn ambuild(
 #[pg_guard]
 pub unsafe extern "C-unwind" fn ambuildempty(_indexrel: pg_sys::Relation) {}
 
-// Incremental insert maintenance is deferred; the graph is (re)built at
-// CREATE INDEX / REINDEX time.
+// Store the new row's tokens in index storage (WAL-logged, in the writing
+// transaction). The resolved graph catches up on the next maintain().
 #[pg_guard]
 pub unsafe extern "C-unwind" fn aminsert(
-    _indexrel: pg_sys::Relation,
-    _values: *mut pg_sys::Datum,
-    _isnull: *mut bool,
-    _heap_tid: pg_sys::ItemPointer,
+    indexrel: pg_sys::Relation,
+    values: *mut pg_sys::Datum,
+    isnull: *mut bool,
+    heap_tid: pg_sys::ItemPointer,
     _heaprel: pg_sys::Relation,
     _check_unique: pg_sys::IndexUniqueCheck::Type,
     _index_unchanged: bool,
     _index_info: *mut pg_sys::IndexInfo,
 ) -> bool {
+    use pgrx::datum::FromDatum;
+    let body = String::from_datum(*values, *isnull).unwrap_or_default();
+    let tokens = tokenize(&body);
+    let block = (((*heap_tid).ip_blkid.bi_hi as u32) << 16) | (*heap_tid).ip_blkid.bi_lo as u32;
+    let offset = (*heap_tid).ip_posid;
+    storage::append(indexrel, &storage::encode(block, offset, &tokens));
     false
 }
 
@@ -685,8 +716,9 @@ use std::time::Duration;
 
 static MAINTENANCE_DATABASE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 
-// Apply queued changes for every watch that has any. Returns the total
-// number of changes applied.
+// Bring every graphwright graph current: re-resolve each index from its
+// own storage (the index path), and drain the change queue (the no-index
+// reindex path). Returns a rough count of watches touched.
 fn drain_all() -> i64 {
     use pgrx::Spi;
     if Spi::get_one::<bool>("SELECT to_regnamespace('graphwright') IS NOT NULL")
@@ -696,7 +728,46 @@ fn drain_all() -> i64 {
     {
         return 0;
     }
-    let watch_ids: Vec<i32> = Spi::connect(|client| {
+    let mut touched = 0i64;
+
+    // Index path: re-resolve every graphwright index from its storage.
+    let indexes: Vec<(pg_sys::Oid, pg_sys::Oid)> = Spi::connect(|client| {
+        let table = client.select(
+            "SELECT i.indexrelid, i.indrelid FROM pg_index i \
+             JOIN pg_class c ON c.oid = i.indexrelid \
+             JOIN pg_am a ON a.oid = c.relam WHERE a.amname = 'graphwright'",
+            None,
+            &[],
+        )?;
+        let mut v = Vec::new();
+        for row in table {
+            v.push((
+                row.get::<pg_sys::Oid>(1)?.expect("indexrelid"),
+                row.get::<pg_sys::Oid>(2)?.expect("indrelid"),
+            ));
+        }
+        Ok::<_, pgrx::spi::Error>(v)
+    })
+    .unwrap_or_default();
+    for (indexrelid, heaprelid) in indexes {
+        let watch_id = Spi::get_one::<i32>(&format!(
+            "SELECT id FROM graphwright.watch WHERE source_table::oid = {}::oid",
+            heaprelid.to_u32()
+        ))
+        .ok()
+        .flatten();
+        if let Some(wid) = watch_id {
+            unsafe {
+                let rel = pg_sys::relation_open(indexrelid, pg_sys::AccessShareLock as i32);
+                resolve_from_storage(rel, wid);
+                pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+            }
+            touched += 1;
+        }
+    }
+
+    // No-index path: drain any queued source-row changes.
+    let dirty: Vec<i32> = Spi::connect(|client| {
         let table = client.select("SELECT DISTINCT watch_id FROM graphwright.dirty", None, &[])?;
         let mut v = Vec::new();
         for row in table {
@@ -705,7 +776,8 @@ fn drain_all() -> i64 {
         Ok::<_, pgrx::spi::Error>(v)
     })
     .unwrap_or_default();
-    watch_ids.into_iter().map(process_dirty).sum()
+    touched += dirty.into_iter().map(process_dirty).sum::<i64>();
+    touched
 }
 
 #[pg_guard]
@@ -844,12 +916,14 @@ GRANT SELECT ON ALL TABLES IN SCHEMA graphwright TO PUBLIC;
         name = "catalog",
     );
 
-    // Register a table's text column as a document source. Returns the
-    // watch id. pk_column names the column used as provenance back to the
-    // source row.
+    // Register a table's text column as a document source (no index).
+    // Installs the capture trigger so changes queue for process_dirty.
+    // pk_column names the column used as provenance back to the source row.
     #[pg_extern]
     fn watch(source_table: &str, text_column: &str, pk_column: &str) -> i32 {
-        super::upsert_watch(source_table, text_column, pk_column)
+        let id = super::upsert_watch(source_table, text_column, pk_column);
+        super::install_capture_trigger(id);
+        id
     }
 
     // Rebuild the whole graph for a watch from the current source rows.
@@ -1131,34 +1205,31 @@ mod tests {
         .unwrap()
     }
 
-    // The capture trigger queues row changes; process_dirty applies them.
+    // aminsert writes each change into index storage; maintain() re-resolves
+    // the graph from there, and the RLS probe hides rows whose ctid is dead.
     #[pg_test]
     fn live_maintenance_applies_inserts_updates_deletes() {
         Spi::run("CREATE TABLE notes (id int PRIMARY KEY, owner text, body text)").unwrap();
         Spi::run("INSERT INTO notes VALUES (1, 'amir', 'Sara Tehran')").unwrap();
         Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
-        let wid = Spi::get_one::<i32>(
-            "SELECT id FROM graphwright.watch WHERE source_table = 'notes'::regclass",
-        )
-        .unwrap()
-        .unwrap();
         assert_eq!(all_entities(), vec!["sara", "tehran"]);
 
-        // INSERT: the trigger queues it, process_dirty adds it.
+        // INSERT: aminsert stores it, maintain() resolves it in.
         Spi::run("INSERT INTO notes VALUES (2, 'amir', 'Reza Berlin')").unwrap();
-        Spi::run(&format!("SELECT graphwright.process_dirty({wid})")).unwrap();
+        Spi::run("SELECT graphwright.maintain()").unwrap();
         assert_eq!(all_entities(), vec!["berlin", "reza", "sara", "tehran"]);
 
-        // UPDATE: the old row's contribution is removed, the new one added.
+        // UPDATE: the new row's tokens are stored under a new ctid; the old
+        // ctid is now dead, so its tokens drop out at query time.
         Spi::run("UPDATE notes SET body = 'Sara Paris' WHERE id = 1").unwrap();
-        Spi::run(&format!("SELECT graphwright.process_dirty({wid})")).unwrap();
+        Spi::run("SELECT graphwright.maintain()").unwrap();
         let updated = all_entities();
         assert!(updated.contains(&"paris".to_string()));
         assert!(!updated.contains(&"tehran".to_string())); // only row 1 had it
 
-        // DELETE: the row's contribution is removed.
+        // DELETE: the row's ctid goes dead, so its tokens drop out.
         Spi::run("DELETE FROM notes WHERE id = 2").unwrap();
-        Spi::run(&format!("SELECT graphwright.process_dirty({wid})")).unwrap();
+        Spi::run("SELECT graphwright.maintain()").unwrap();
         let deleted = all_entities();
         assert!(!deleted.contains(&"reza".to_string()));
         assert!(!deleted.contains(&"berlin".to_string()));
