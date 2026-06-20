@@ -8,15 +8,15 @@ This is the Postgres-native sibling of [graphwright](https://github.com/hoofader
 
 ## Status
 
-Early. This is milestone 1a: the data model and the RLS-aware query surface, proven end to end. Extraction is a deterministic stub (tokenize a row, co-mention edges), wired through a manual `reindex` rather than a live index. The pieces still to come:
+Early. The data model, the RLS-aware query surface, and a real index access method are in place and proven end to end. `CREATE INDEX ... USING graphwright (body)` builds the graph; the accessors filter it per user against the source table's RLS. Extraction is still a deterministic stub (tokenize a row, co-mention edges). The pieces still to come:
 
-- the real index access method, so `CREATE INDEX ... USING graphwright (body)` drives extraction on row change,
-- a background worker for incremental maintenance,
+- incremental maintenance: `aminsert` / `ambulkdelete` are no-ops for now, so the graph is built at `CREATE INDEX` / `REINDEX` time. A background worker off a change queue is next.
 - a real extraction seam (a local LLM / GLiNER via graphwright-onnx, judged by a larger model),
 - the resolution cascade (phonetic, fuzzy, embedding) ported from the graphwright core,
-- a human-in-the-loop review queue (proposals an operator accepts or rejects).
+- a human-in-the-loop review queue (proposals an operator accepts or rejects),
+- locking the catalog down so the accessors are the only door.
 
-What milestone 1a does prove is the part nobody else ships: row-derived graph visibility.
+What is already proven is the part nobody else ships: row-derived graph visibility.
 
 ## Try it
 
@@ -32,14 +32,15 @@ INSERT INTO notes VALUES
   (1, 'amir', 'Sara Tehran'),
   (2, 'nadia', 'Sara Berlin');
 
--- Register the text column and build the graph over every row.
-SELECT graphwright.watch('notes', 'body', 'id');
-SELECT graphwright.reindex(1);
+-- Build the knowledge-graph index over the body column.
+CREATE INDEX notes_kg ON notes USING graphwright (body);
 
 -- amir sees only the graph from row 1; nadia only from row 2.
 SET ROLE amir;
 SELECT * FROM graphwright.edges('notes');
 ```
+
+`graphwright.watch(table, text_col, pk_col)` + `graphwright.reindex(id)` are also exposed for building the graph without an index (with a primary-key column as provenance instead of `ctid`).
 
 ## Edge visibility
 

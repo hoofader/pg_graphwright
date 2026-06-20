@@ -8,10 +8,10 @@
 // decides which rows the user can read, and the graph is filtered to
 // match. No bespoke access-control engine; we delegate to RLS.
 //
-// Milestone 1a proves that thesis with a deterministic stub extractor
-// (tokenize a row, co-mention edges) and a manual `reindex`. The real
-// index access method and an LLM/GLiNER extraction seam come later; they
-// change how the graph is filled, not how it is filtered.
+// Extraction is a deterministic stub for now (tokenize a row, co-mention
+// edges); a real LLM/GLiNER seam comes later. That changes how the graph
+// is filled, not how it is filtered. `CREATE INDEX ... USING graphwright`
+// drives the build through the index access method below.
 
 use pgrx::prelude::*;
 
@@ -81,9 +81,284 @@ fn watch_meta(source_table: &str) -> WatchMeta {
     .expect("watch_meta")
 }
 
+// Register (or update) a watch and return its id. The index AM passes
+// pk_column = "ctid", which the RLS accessors then probe as `(s.ctid)::text`.
+fn upsert_watch(source_table: &str, text_column: &str, pk_column: &str) -> i32 {
+    let sql = format!(
+        "INSERT INTO graphwright.watch (source_table, text_column, pk_column) \
+         VALUES ({}::regclass, {}, {}) \
+         ON CONFLICT (source_table, text_column) \
+         DO UPDATE SET pk_column = EXCLUDED.pk_column \
+         RETURNING id",
+        lit(source_table),
+        lit(text_column),
+        lit(pk_column),
+    );
+    pgrx::Spi::get_one::<i32>(&sql)
+        .expect("watch insert")
+        .expect("watch id")
+}
+
+// The stub extractor, shared by reindex() and the index AM's build: each
+// token is an entity (exact-folded on its normalized surface), consecutive
+// tokens in a row are a co-mention edge, and the source row is recorded as
+// provenance. Sees every row, so it must run privileged (table owner /
+// superuser / index build).
+fn rebuild(watch_id: i32) -> i64 {
+    use pgrx::Spi;
+    let (source_table, text_column, pk_column) =
+        Spi::get_three::<String, String, String>(&format!(
+            "SELECT source_table::text, text_column, pk_column \
+             FROM graphwright.watch WHERE id = {watch_id}"
+        ))
+        .expect("watch lookup");
+    let source_table = source_table.expect("source table");
+    let text_column = text_column.expect("text column");
+    let pk_column = pk_column.expect("pk column");
+
+    let rows: Vec<(String, String)> = Spi::connect(|client| {
+        let sql = format!(
+            "SELECT ({pk})::text, ({txt})::text FROM {tbl}",
+            pk = ident(&pk_column),
+            txt = ident(&text_column),
+            tbl = source_table,
+        );
+        let table = client.select(&sql, None, &[])?;
+        let mut out = Vec::new();
+        for row in table {
+            out.push((
+                row.get::<String>(1)?.unwrap_or_default(),
+                row.get::<String>(2)?.unwrap_or_default(),
+            ));
+        }
+        Ok::<_, pgrx::spi::Error>(out)
+    })
+    .expect("read source rows");
+
+    Spi::run(&format!(
+        "DELETE FROM graphwright.entity WHERE watch_id = {watch_id}"
+    ))
+    .expect("clear watch");
+
+    let mut mentions = 0i64;
+    for (pk, body) in &rows {
+        let mut ids: Vec<i64> = Vec::new();
+        for tok in tokenize(body) {
+            let entity_id = Spi::get_one::<i64>(&format!(
+                "INSERT INTO graphwright.entity (watch_id, surface) VALUES ({watch_id}, {surf}) \
+                 ON CONFLICT (watch_id, surface) DO UPDATE SET surface = EXCLUDED.surface \
+                 RETURNING id",
+                surf = lit(&tok),
+            ))
+            .expect("entity upsert")
+            .expect("entity id");
+            Spi::run(&format!(
+                "INSERT INTO graphwright.mention (watch_id, entity_id, source_pk, surface_form) \
+                 VALUES ({watch_id}, {entity_id}, {pk}, {sf})",
+                pk = lit(pk),
+                sf = lit(&tok),
+            ))
+            .expect("mention insert");
+            mentions += 1;
+            ids.push(entity_id);
+        }
+        for pair in ids.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            if a == b {
+                continue;
+            }
+            let (src, dst) = if a < b { (a, b) } else { (b, a) };
+            let edge_id = Spi::get_one::<i64>(&format!(
+                "INSERT INTO graphwright.edge (watch_id, src, dst) VALUES ({watch_id}, {src}, {dst}) \
+                 ON CONFLICT (watch_id, src, dst, predicate) DO UPDATE SET predicate = EXCLUDED.predicate \
+                 RETURNING id",
+            ))
+            .expect("edge upsert")
+            .expect("edge id");
+            Spi::run(&format!(
+                "INSERT INTO graphwright.edge_support (edge_id, source_pk) VALUES ({edge_id}, {pk}) \
+                 ON CONFLICT DO NOTHING",
+                pk = lit(pk),
+            ))
+            .expect("edge support");
+        }
+    }
+    mentions
+}
+
+// ─── index access method ───────────────────────────────────────────
+//
+// `CREATE INDEX ... USING graphwright (body)` registers the table's text
+// column as a watch (with ctid provenance) and builds the graph. The
+// index stores nothing of its own; the graph lives in the catalog tables
+// and is queried through the RLS-aware accessors. Incremental aminsert /
+// ambulkdelete are no-ops for now (rebuild on REINDEX); live maintenance
+// is the next milestone (a background worker off a change queue).
+
+use core::ffi::{c_int, c_void};
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn ambuild(
+    heaprel: pg_sys::Relation,
+    _indexrel: pg_sys::Relation,
+    index_info: *mut pg_sys::IndexInfo,
+) -> *mut pg_sys::IndexBuildResult {
+    let attnum = (*index_info).ii_IndexAttrNumbers[0];
+    if attnum == 0 {
+        pgrx::error!("graphwright index requires a plain column, not an expression");
+    }
+    let heap_oid = (*heaprel).rd_id;
+    let cname = pg_sys::get_attname(heap_oid, attnum, false);
+    let column = std::ffi::CStr::from_ptr(cname)
+        .to_string_lossy()
+        .into_owned();
+    let table =
+        pgrx::Spi::get_one::<String>(&format!("SELECT {}::regclass::text", heap_oid.to_u32()))
+            .expect("table name")
+            .expect("table name");
+    let watch_id = upsert_watch(&table, &column, "ctid");
+    let n = rebuild(watch_id);
+
+    let mut result = pgrx::PgBox::<pg_sys::IndexBuildResult>::alloc0();
+    result.heap_tuples = n as f64;
+    result.index_tuples = n as f64;
+    result.into_pg()
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn ambuildempty(_indexrel: pg_sys::Relation) {}
+
+// Incremental insert maintenance is deferred; the graph is (re)built at
+// CREATE INDEX / REINDEX time.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn aminsert(
+    _indexrel: pg_sys::Relation,
+    _values: *mut pg_sys::Datum,
+    _isnull: *mut bool,
+    _heap_tid: pg_sys::ItemPointer,
+    _heaprel: pg_sys::Relation,
+    _check_unique: pg_sys::IndexUniqueCheck::Type,
+    _index_unchanged: bool,
+    _index_info: *mut pg_sys::IndexInfo,
+) -> bool {
+    false
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn ambulkdelete(
+    _info: *mut pg_sys::IndexVacuumInfo,
+    stats: *mut pg_sys::IndexBulkDeleteResult,
+    _callback: pg_sys::IndexBulkDeleteCallback,
+    _callback_state: *mut c_void,
+) -> *mut pg_sys::IndexBulkDeleteResult {
+    if stats.is_null() {
+        pgrx::PgBox::<pg_sys::IndexBulkDeleteResult>::alloc0().into_pg()
+    } else {
+        stats
+    }
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn amvacuumcleanup(
+    _info: *mut pg_sys::IndexVacuumInfo,
+    stats: *mut pg_sys::IndexBulkDeleteResult,
+) -> *mut pg_sys::IndexBulkDeleteResult {
+    stats
+}
+
+// No scans are served (amgettuple/amgetbitmap are None), so price the AM
+// out of any scan path.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn amcostestimate(
+    _root: *mut pg_sys::PlannerInfo,
+    _path: *mut pg_sys::IndexPath,
+    _loop_count: f64,
+    index_startup_cost: *mut pg_sys::Cost,
+    index_total_cost: *mut pg_sys::Cost,
+    index_selectivity: *mut pg_sys::Selectivity,
+    index_correlation: *mut f64,
+    index_pages: *mut f64,
+) {
+    *index_startup_cost = 0.0;
+    *index_total_cost = f64::MAX;
+    *index_selectivity = 1.0;
+    *index_correlation = 0.0;
+    *index_pages = 0.0;
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn amoptions(
+    _reloptions: pg_sys::Datum,
+    _validate: bool,
+) -> *mut pg_sys::bytea {
+    std::ptr::null_mut()
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn amvalidate(_opclassoid: pg_sys::Oid) -> bool {
+    true
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn ambeginscan(
+    indexrel: pg_sys::Relation,
+    nkeys: c_int,
+    norderbys: c_int,
+) -> pg_sys::IndexScanDesc {
+    pg_sys::RelationGetIndexScan(indexrel, nkeys, norderbys)
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn amrescan(
+    _scan: pg_sys::IndexScanDesc,
+    _keys: pg_sys::ScanKey,
+    _nkeys: c_int,
+    _orderbys: pg_sys::ScanKey,
+    _norderbys: c_int,
+) {
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn amendscan(_scan: pg_sys::IndexScanDesc) {}
+
+#[pg_extern(sql = "
+CREATE FUNCTION graphwright_amhandler(internal) RETURNS index_am_handler
+    PARALLEL SAFE IMMUTABLE STRICT COST 0.0001
+    LANGUAGE c AS 'MODULE_PATHNAME', '@FUNCTION_NAME@';
+CREATE ACCESS METHOD graphwright TYPE INDEX HANDLER graphwright_amhandler;
+CREATE OPERATOR CLASS graphwright_text_ops DEFAULT FOR TYPE text
+    USING graphwright AS STORAGE text;
+")]
+fn graphwright_amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> pgrx::PgBox<pg_sys::IndexAmRoutine> {
+    let mut amroutine = unsafe {
+        pgrx::PgBox::<pg_sys::IndexAmRoutine>::alloc_node(pg_sys::NodeTag::T_IndexAmRoutine)
+    };
+
+    amroutine.amstrategies = 0;
+    amroutine.amsupport = 0;
+    amroutine.amcanmulticol = false;
+    amroutine.amkeytype = pg_sys::InvalidOid;
+
+    amroutine.ambuild = Some(ambuild);
+    amroutine.ambuildempty = Some(ambuildempty);
+    amroutine.aminsert = Some(aminsert);
+    amroutine.ambulkdelete = Some(ambulkdelete);
+    amroutine.amvacuumcleanup = Some(amvacuumcleanup);
+    amroutine.amcostestimate = Some(amcostestimate);
+    amroutine.amoptions = Some(amoptions);
+    amroutine.amvalidate = Some(amvalidate);
+    amroutine.ambeginscan = Some(ambeginscan);
+    amroutine.amrescan = Some(amrescan);
+    amroutine.amendscan = Some(amendscan);
+    amroutine.amgettuple = None;
+    amroutine.amgetbitmap = None;
+
+    amroutine.into_pg_boxed()
+}
+
 #[pg_schema]
 mod graphwright {
-    use super::{ident, lit, tokenize, watch_meta, Visibility};
+    use super::{ident, watch_meta, Visibility};
     use pgrx::prelude::*;
 
     // Catalog lives inside the schema module so pgrx orders it after the
@@ -144,107 +419,14 @@ GRANT SELECT ON ALL TABLES IN SCHEMA graphwright TO PUBLIC;
     // source row.
     #[pg_extern]
     fn watch(source_table: &str, text_column: &str, pk_column: &str) -> i32 {
-        let sql = format!(
-            "INSERT INTO graphwright.watch (source_table, text_column, pk_column) \
-             VALUES ({}::regclass, {}, {}) \
-             ON CONFLICT (source_table, text_column) \
-             DO UPDATE SET pk_column = EXCLUDED.pk_column \
-             RETURNING id",
-            lit(source_table),
-            lit(text_column),
-            lit(pk_column),
-        );
-        Spi::get_one::<i32>(&sql)
-            .expect("watch insert")
-            .expect("watch id")
+        super::upsert_watch(source_table, text_column, pk_column)
     }
 
     // Rebuild the whole graph for a watch from the current source rows.
-    // The stub extractor: each token is an entity (exact-folded on its
-    // normalized surface), consecutive tokens in a row are a co-mention
-    // edge, and the source row is recorded as provenance. Runs with the
-    // caller's privileges, so a full reindex must see every row (run it
-    // as the table owner or a superuser).
+    // Shares the extraction core with the index AM's build path.
     #[pg_extern]
     fn reindex(watch_id: i32) -> i64 {
-        let (source_table, text_column, pk_column) =
-            Spi::get_three::<String, String, String>(&format!(
-                "SELECT source_table::text, text_column, pk_column \
-                 FROM graphwright.watch WHERE id = {watch_id}"
-            ))
-            .expect("watch lookup");
-        let source_table = source_table.expect("source table");
-        let text_column = text_column.expect("text column");
-        let pk_column = pk_column.expect("pk column");
-
-        let rows: Vec<(String, String)> = Spi::connect(|client| {
-            let sql = format!(
-                "SELECT ({pk})::text, ({txt})::text FROM {tbl}",
-                pk = ident(&pk_column),
-                txt = ident(&text_column),
-                tbl = source_table,
-            );
-            let table = client.select(&sql, None, &[])?;
-            let mut out = Vec::new();
-            for row in table {
-                out.push((
-                    row.get::<String>(1)?.unwrap_or_default(),
-                    row.get::<String>(2)?.unwrap_or_default(),
-                ));
-            }
-            Ok::<_, pgrx::spi::Error>(out)
-        })
-        .expect("read source rows");
-
-        Spi::run(&format!(
-            "DELETE FROM graphwright.entity WHERE watch_id = {watch_id}"
-        ))
-        .expect("clear watch");
-
-        let mut mentions = 0i64;
-        for (pk, body) in &rows {
-            let mut ids: Vec<i64> = Vec::new();
-            for tok in tokenize(body) {
-                let entity_id = Spi::get_one::<i64>(&format!(
-                    "INSERT INTO graphwright.entity (watch_id, surface) VALUES ({watch_id}, {surf}) \
-                     ON CONFLICT (watch_id, surface) DO UPDATE SET surface = EXCLUDED.surface \
-                     RETURNING id",
-                    surf = lit(&tok),
-                ))
-                .expect("entity upsert")
-                .expect("entity id");
-                Spi::run(&format!(
-                    "INSERT INTO graphwright.mention (watch_id, entity_id, source_pk, surface_form) \
-                     VALUES ({watch_id}, {entity_id}, {pk}, {sf})",
-                    pk = lit(pk),
-                    sf = lit(&tok),
-                ))
-                .expect("mention insert");
-                mentions += 1;
-                ids.push(entity_id);
-            }
-            for pair in ids.windows(2) {
-                let (a, b) = (pair[0], pair[1]);
-                if a == b {
-                    continue;
-                }
-                let (src, dst) = if a < b { (a, b) } else { (b, a) };
-                let edge_id = Spi::get_one::<i64>(&format!(
-                    "INSERT INTO graphwright.edge (watch_id, src, dst) VALUES ({watch_id}, {src}, {dst}) \
-                     ON CONFLICT (watch_id, src, dst, predicate) DO UPDATE SET predicate = EXCLUDED.predicate \
-                     RETURNING id",
-                ))
-                .expect("edge upsert")
-                .expect("edge id");
-                Spi::run(&format!(
-                    "INSERT INTO graphwright.edge_support (edge_id, source_pk) VALUES ({edge_id}, {pk}) \
-                     ON CONFLICT DO NOTHING",
-                    pk = lit(pk),
-                ))
-                .expect("edge support");
-            }
-        }
-        mentions
+        super::rebuild(watch_id)
     }
 
     // Entities visible to the caller: those mentioned by at least one
@@ -447,6 +629,33 @@ mod tests {
         // single-row edges role_a fully sees still show.
         assert!(a.contains(&("sara".into(), "tehran".into())));
         assert!(a.contains(&("berlin".into(), "reza".into())));
+    }
+
+    // CREATE INDEX ... USING graphwright drives the same extraction with
+    // ctid provenance, and the graph stays RLS-filtered per user.
+    #[pg_test]
+    fn create_index_builds_the_rls_filtered_graph() {
+        Spi::run("CREATE TABLE notes (id int PRIMARY KEY, owner text, body text)").unwrap();
+        Spi::run("ALTER TABLE notes ENABLE ROW LEVEL SECURITY").unwrap();
+        Spi::run("CREATE POLICY owner_can_read ON notes USING (owner = current_user)").unwrap();
+        Spi::run("GRANT SELECT ON notes TO PUBLIC").unwrap();
+        Spi::run("CREATE ROLE role_a").unwrap();
+        Spi::run("CREATE ROLE role_b").unwrap();
+        Spi::run(
+            "INSERT INTO notes VALUES \
+             (1, 'role_a', 'Sara Tehran'), \
+             (2, 'role_b', 'Sara Berlin'), \
+             (3, 'role_a', 'Reza Berlin'), \
+             (4, 'role_a', 'Sara Berlin')",
+        )
+        .unwrap();
+        Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+
+        let a = edges_as("role_a");
+        assert!(a.contains(&("sara".into(), "berlin".into())));
+        assert!(a.contains(&("sara".into(), "tehran".into())));
+        assert!(a.contains(&("berlin".into(), "reza".into())));
+        assert_eq!(edges_as("role_b"), vec![("sara".into(), "berlin".into())]);
     }
 }
 
