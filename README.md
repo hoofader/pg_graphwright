@@ -8,10 +8,10 @@ This is the Postgres-native sibling of [graphwright](https://github.com/hoofader
 
 ## Status
 
-Early, but the storage model is now the Postgres-native one. `CREATE INDEX ... USING graphwright (body)` stores each row's extraction in the **index relation's own pages** (WAL-logged through generic WAL, like pg_search), so it is transactional with the heap and travels with physical replication. `aminsert` writes only a tiny marker on a write; the extractor and judge run asynchronously off the writing transaction, so a slow model never blocks a write. `ambulkdelete` reclaims deleted rows' records on vacuum. The cross-row resolved graph (entities/edges) is derived from index storage into catalog tables, refreshed by `graphwright.maintain()`; the accessors filter it per user against the source table's RLS. Extraction and judging are pluggable seams (`graphwright.extractor`, `graphwright.judge`), defaulting to a built-in tokenizer and no judge. The pieces still to come:
+Early, but the storage model is now the Postgres-native one. `CREATE INDEX ... USING graphwright (body)` stores each row's extraction in the **index relation's own pages** (WAL-logged through generic WAL, like pg_search), so it is transactional with the heap and travels with physical replication. `aminsert` writes only a tiny marker on a write; the extractor and judge run asynchronously off the writing transaction, so a slow model never blocks a write. `ambulkdelete` reclaims deleted rows' records on vacuum. The cross-row resolved graph (entities/edges) is derived from index storage into catalog tables, refreshed by `graphwright.maintain()`; the accessors filter it per user against the source table's RLS. Extraction and judging are pluggable seams (`graphwright.extractor`, `graphwright.judge`), defaulting to a built-in tokenizer and no judge. Resolution folds entity surfaces on a normalized key (Arabic/Persian script and diacritic variants meet), and `graphwright.proposals()` surfaces cross-script phonetic matches for review. The pieces still to come:
 
-- the resolution cascade (phonetic, fuzzy, embedding) ported from the graphwright core,
-- a human-in-the-loop review queue (proposals an operator accepts or rejects),
+- the rest of the cascade (entropy gate, fuzzy/MinHash, embedding) and full NFKC,
+- a human-in-the-loop review queue that accepts a proposal and merges the entities,
 - locking the catalog down so the accessors are the only door.
 
 What is already proven is the part nobody else ships: row-derived graph visibility.
@@ -96,6 +96,20 @@ SET graphwright.judge = 'vet';
 ```
 
 This is the "AI output is never canon" step: the small model proposes mentions, the larger model disposes. A judge error or NULL leaves the extractor's output unchanged.
+
+## Resolution
+
+A mention's surface resolves to an entity by **exact match on a normalized key** (ported from the graphwright core): Arabic vs Persian yeh/kaf, alef variants, diacritics, tatweel, ZWNJ joins, case, and surrounding punctuation all fold, so `علي` and `علی` are one entity.
+
+Cross-script and spelling matches that exact cannot reach are surfaced as **proposals**, not auto-merges (only exact is canon). Each entity carries phonetic keys (cross-script consonant skeletons), and:
+
+```sql
+SELECT * FROM graphwright.proposals('notes');
+-- entity_a | surface_a | entity_b | surface_b
+--    1     | faeze     |    2     | فائزه
+```
+
+pairs visible entities that share a key. A review step that accepts a proposal and merges the entities is the next milestone. The rest of the cascade (entropy gate, fuzzy/MinHash, embedding) is still to come.
 
 ## Build
 
