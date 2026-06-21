@@ -261,3 +261,109 @@ pub fn phonetic_keys(name: &str) -> Vec<String> {
         .filter(|k| seen.insert(k.clone()))
         .collect()
 }
+
+// ─── entropy gate ───────────────────────────────────────────────────
+//
+// Short, low-entropy names ("Ali", "علی", "bob") produce false matches:
+// one edit reaches a different real name. The gate keeps them out of
+// phonetic auto-merge (they stay proposals); distinctive names auto-merge.
+
+const ENTROPY_THRESHOLD: f64 = 2.0;
+
+fn shannon_entropy(s: &str) -> f64 {
+    let mut counts = std::collections::HashMap::new();
+    let mut n = 0usize;
+    for ch in s.chars() {
+        *counts.entry(ch).or_insert(0usize) += 1;
+        n += 1;
+    }
+    if n == 0 {
+        return 0.0;
+    }
+    let mut h = 0.0;
+    for &c in counts.values() {
+        let p = c as f64 / n as f64;
+        h -= p * p.log2();
+    }
+    h
+}
+
+/// Distinctive enough to auto-merge a phonetic match (>= 2 bits ~ four
+/// reasonably distinct characters). "علی" and "bob" fail; longer names pass.
+pub fn passes_entropy_gate(normalized: &str) -> bool {
+    shannon_entropy(normalized) >= ENTROPY_THRESHOLD
+}
+
+// ─── canonical merge (union-find) ───────────────────────────────────
+//
+// Entities are keyed by a canonical norm: norms linked by a merge edge
+// (manual decision, or gated phonetic) collapse to one entity. The rep is
+// the lexicographically smallest norm, so the result is order-independent.
+
+use std::collections::{HashMap, HashSet};
+
+fn find(parent: &mut HashMap<String, String>, x: &str) -> String {
+    let mut root = x.to_string();
+    while parent[&root] != root {
+        root = parent[&root].clone();
+    }
+    let mut cur = x.to_string();
+    while parent[&cur] != root {
+        let next = parent[&cur].clone();
+        parent.insert(cur, root.clone());
+        cur = next;
+    }
+    root
+}
+
+/// Map each norm to its canonical norm given merge edges. The smaller norm
+/// of a union becomes the root, so canon(norm) is deterministic.
+pub fn canonical_map(
+    norms: &HashSet<String>,
+    merges: &[(String, String)],
+) -> HashMap<String, String> {
+    let mut parent: HashMap<String, String> =
+        norms.iter().map(|n| (n.clone(), n.clone())).collect();
+    for (a, b) in merges {
+        if !parent.contains_key(a) || !parent.contains_key(b) {
+            continue;
+        }
+        let ra = find(&mut parent, a);
+        let rb = find(&mut parent, b);
+        if ra != rb {
+            let (keep, drop) = if ra <= rb { (ra, rb) } else { (rb, ra) };
+            parent.insert(drop, keep);
+        }
+    }
+    let mut canon = HashMap::new();
+    for n in norms {
+        let r = find(&mut parent, n);
+        canon.insert(n.clone(), r);
+    }
+    canon
+}
+
+/// Norm pairs (sorted) that should auto-merge on a shared phonetic key,
+/// limited to names distinctive enough to pass the entropy gate.
+pub fn gated_phonetic_pairs(norms: &HashSet<String>) -> Vec<(String, String)> {
+    let mut by_key: HashMap<String, Vec<String>> = HashMap::new();
+    for n in norms {
+        if !passes_entropy_gate(n) {
+            continue;
+        }
+        for k in phonetic_keys(n) {
+            by_key.entry(k).or_default().push(n.clone());
+        }
+    }
+    let mut pairs = HashSet::new();
+    for (_, mut ns) in by_key {
+        ns.sort();
+        ns.dedup();
+        for i in 0..ns.len() {
+            for j in (i + 1)..ns.len() {
+                pairs.insert((ns[i].clone(), ns[j].clone()));
+            }
+        }
+    }
+    pairs.into_iter().collect()
+}

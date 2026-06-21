@@ -18,7 +18,8 @@ use pgrx::prelude::*;
 pgrx::pg_module_magic!(name, version);
 
 mod resolve;
-use resolve::{normalize_name, phonetic_keys};
+use resolve::{canonical_map, gated_phonetic_pairs, normalize_name, phonetic_keys};
+use std::collections::HashSet;
 
 fn lit(s: &str) -> String {
     pgrx::spi::quote_literal(s)
@@ -189,18 +190,147 @@ fn install_capture_trigger(watch_id: i32) {
 // truth for the index path.
 fn resolve_from_storage(indexrel: pg_sys::Relation, watch_id: i32) {
     use pgrx::Spi;
+
+    // Read the mentions, then decide entity identity before writing the
+    // graph: collect norms, merge what decisions and gated phonetic
+    // matches link, and resolve to canonical norms.
+    let records: Vec<(String, Vec<String>)> = unsafe { storage::scan(indexrel) }
+        .iter()
+        .filter_map(|rec| {
+            let (tag, block, offset, surfaces) = storage::decode(rec);
+            (tag == MENTIONS).then(|| (format!("({block},{offset})"), surfaces))
+        })
+        .collect();
+
+    let mut norms: HashSet<String> = HashSet::new();
+    for (_, surfaces) in &records {
+        for s in surfaces {
+            let n = normalize_name(s);
+            if !n.is_empty() {
+                norms.insert(n);
+            }
+        }
+    }
+    let (manual, splits) = read_decisions(watch_id);
+    let split_set: HashSet<(String, String)> = splits.into_iter().collect();
+    let merges: Vec<(String, String)> = manual
+        .into_iter()
+        .chain(gated_phonetic_pairs(&norms))
+        .filter(|p| !split_set.contains(p))
+        .collect();
+    let canon = canonical_map(&norms, &merges);
+
     Spi::run(&format!(
         "DELETE FROM graphwright.entity WHERE watch_id = {watch_id}"
     ))
     .expect("clear watch");
-    let records = unsafe { storage::scan(indexrel) };
-    for rec in &records {
-        let (tag, block, offset, surfaces) = storage::decode(rec);
-        if tag != MENTIONS {
-            continue; // skip markers that are not yet extracted
-        }
-        resolve_tokens(watch_id, &format!("({block},{offset})"), &surfaces);
+    for (ctid, surfaces) in &records {
+        resolve_tokens(watch_id, ctid, surfaces, &canon);
     }
+}
+
+// Read a watch's durable decisions as sorted norm pairs: (merges, splits).
+fn read_decisions(watch_id: i32) -> (Vec<(String, String)>, Vec<(String, String)>) {
+    use pgrx::Spi;
+    let rows: Vec<(String, String, String)> = Spi::connect(|client| {
+        let table = client.select(
+            &format!(
+                "SELECT norm_a, norm_b, verdict FROM graphwright.decision WHERE watch_id = {watch_id}"
+            ),
+            None,
+            &[],
+        )?;
+        let mut out = Vec::new();
+        for row in table {
+            out.push((
+                row.get::<String>(1)?.expect("norm_a"),
+                row.get::<String>(2)?.expect("norm_b"),
+                row.get::<String>(3)?.expect("verdict"),
+            ));
+        }
+        Ok::<_, pgrx::spi::Error>(out)
+    })
+    .unwrap_or_default();
+    let mut merges = Vec::new();
+    let mut splits = Vec::new();
+    for (a, b, verdict) in rows {
+        if verdict == "merge" {
+            merges.push((a, b));
+        } else {
+            splits.push((a, b));
+        }
+    }
+    (merges, splits)
+}
+
+fn watch_id_of(source_table: &str) -> i32 {
+    pgrx::Spi::get_one::<i32>(&format!(
+        "SELECT id FROM graphwright.watch WHERE source_table = {}::regclass",
+        lit(source_table)
+    ))
+    .expect("watch lookup")
+    .expect("no watch for table")
+}
+
+// Record a durable merge/split decision (normalized, ordered), then
+// re-resolve so it takes effect now. Reversible: drop_decision removes it.
+fn record_decision(source_table: &str, a: &str, b: &str, verdict: &str) -> bool {
+    let wid = watch_id_of(source_table);
+    let (na, nb) = (normalize_name(a), normalize_name(b));
+    if na.is_empty() || nb.is_empty() || na == nb {
+        return false;
+    }
+    let (lo, hi) = if na < nb { (na, nb) } else { (nb, na) };
+    pgrx::Spi::run(&format!(
+        "INSERT INTO graphwright.decision (watch_id, norm_a, norm_b, verdict) \
+         VALUES ({wid}, {a}, {b}, {v}) \
+         ON CONFLICT (watch_id, norm_a, norm_b) \
+         DO UPDATE SET verdict = EXCLUDED.verdict, decided_by = current_user, decided_at = now()",
+        a = lit(&lo),
+        b = lit(&hi),
+        v = lit(verdict),
+    ))
+    .expect("record decision");
+    drain_all();
+    true
+}
+
+fn drop_decision(source_table: &str, a: &str, b: &str) -> bool {
+    let wid = watch_id_of(source_table);
+    let (na, nb) = (normalize_name(a), normalize_name(b));
+    let (lo, hi) = if na < nb { (na, nb) } else { (nb, na) };
+    pgrx::Spi::run(&format!(
+        "DELETE FROM graphwright.decision WHERE watch_id = {wid} AND norm_a = {a} AND norm_b = {b}",
+        a = lit(&lo),
+        b = lit(&hi),
+    ))
+    .expect("drop decision");
+    drain_all();
+    true
+}
+
+fn list_decisions(source_table: &str) -> Vec<(String, String, String)> {
+    let wid = watch_id_of(source_table);
+    pgrx::Spi::connect(|client| {
+        let table = client.select(
+            &format!(
+                "SELECT norm_a, norm_b, verdict FROM graphwright.decision \
+                 WHERE watch_id = {wid} ORDER BY norm_a, norm_b"
+            ),
+            None,
+            &[],
+        )?;
+        let mut out = Vec::new();
+        for row in table {
+            out.push((
+                row.get::<String>(1)?.unwrap(),
+                row.get::<String>(2)?.unwrap(),
+                row.get::<String>(3)?.unwrap(),
+            ));
+        }
+        Ok::<_, pgrx::spi::Error>(out)
+    })
+    .unwrap_or_default()
 }
 
 // Extract every pending row (markers in index storage), writing the
@@ -307,29 +437,40 @@ fn rebuild(watch_id: i32) -> i64 {
 // Add one row's contribution from its source text (tokenize, then
 // resolve). Used by the no-index reindex path.
 fn index_row(watch_id: i32, source_pk: &str, body: &str) -> i64 {
-    resolve_tokens(watch_id, source_pk, &extract(body))
+    resolve_tokens(
+        watch_id,
+        source_pk,
+        &extract(body),
+        &std::collections::HashMap::new(),
+    )
 }
 
 // Resolve a row's already-extracted tokens into entities, mentions, and
 // co-mention edges, tagged with the row's provenance. The index path
 // feeds tokens read from index storage; the reindex path tokenizes first.
-fn resolve_tokens(watch_id: i32, source_pk: &str, tokens: &[String]) -> i64 {
+fn resolve_tokens(
+    watch_id: i32,
+    source_pk: &str,
+    tokens: &[String],
+    canon: &std::collections::HashMap<String, String>,
+) -> i64 {
     use pgrx::Spi;
     let mut ids: Vec<i64> = Vec::new();
     let mut mentions = 0i64;
     for tok in tokens {
-        // Exact resolution folds on the normalized key, so script and
-        // diacritic variants of a name meet as one entity.
+        // Entities are keyed by the canonical norm: exact folds variants,
+        // and canon merges what a decision or a gated phonetic match links.
         let norm = normalize_name(tok);
         if norm.is_empty() {
             continue;
         }
+        let key = canon.get(&norm).cloned().unwrap_or(norm);
         let entity_id = Spi::get_one::<i64>(&format!(
             "INSERT INTO graphwright.entity (watch_id, surface, norm) VALUES ({watch_id}, {surf}, {norm}) \
              ON CONFLICT (watch_id, norm) DO UPDATE SET norm = EXCLUDED.norm \
              RETURNING id",
             surf = lit(tok),
-            norm = lit(&norm),
+            norm = lit(&key),
         ))
         .expect("entity upsert")
         .expect("entity id");
@@ -1153,6 +1294,20 @@ CREATE TABLE graphwright.entity_phonetic (
     PRIMARY KEY (entity_id, key)
 );
 
+-- Durable, human-owned decisions, replayed on every re-resolve: 'merge'
+-- forces two norms to one entity, 'split' keeps them apart (vetoing a
+-- phonetic auto-merge). Edit or delete a row to reverse the decision.
+CREATE TABLE graphwright.decision (
+    watch_id integer NOT NULL REFERENCES graphwright.watch(id) ON DELETE CASCADE,
+    norm_a   text NOT NULL,
+    norm_b   text NOT NULL,
+    verdict  text NOT NULL CHECK (verdict IN ('merge', 'split')),
+    decided_by text NOT NULL DEFAULT current_user,
+    decided_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (watch_id, norm_a, norm_b),
+    CHECK (norm_a < norm_b)
+);
+
 CREATE TABLE graphwright.mention (
     id           bigserial PRIMARY KEY,
     watch_id     integer NOT NULL REFERENCES graphwright.watch(id) ON DELETE CASCADE,
@@ -1361,6 +1516,39 @@ GRANT SELECT ON ALL TABLES IN SCHEMA graphwright TO PUBLIC;
         })
         .expect("proposals query");
         TableIterator::new(rows)
+    }
+
+    // Durable, reversible identity decisions. merge() forces two names to
+    // one entity; split() keeps them apart (vetoing a phonetic auto-merge);
+    // unmerge() drops the decision. Each re-resolves immediately and is
+    // replayed on every later re-resolve. decisions() lists them.
+    #[pg_extern]
+    fn merge(source_table: &str, a: &str, b: &str) -> bool {
+        super::record_decision(source_table, a, b, "merge")
+    }
+
+    #[pg_extern]
+    fn split(source_table: &str, a: &str, b: &str) -> bool {
+        super::record_decision(source_table, a, b, "split")
+    }
+
+    #[pg_extern]
+    fn unmerge(source_table: &str, a: &str, b: &str) -> bool {
+        super::drop_decision(source_table, a, b)
+    }
+
+    #[pg_extern]
+    fn decisions(
+        source_table: &str,
+    ) -> TableIterator<
+        'static,
+        (
+            name!(norm_a, String),
+            name!(norm_b, String),
+            name!(verdict, String),
+        ),
+    > {
+        TableIterator::new(super::list_decisions(source_table))
     }
 
     // Edges visible to the caller. Visibility derives from the supporting
@@ -1777,6 +1965,36 @@ mod tests {
         let (a, b) = &pairs[0];
         assert!(a == "faeze" || b == "faeze");
         assert!(a == "فائزه" || b == "فائزه");
+    }
+
+    // Distinctive phonetic matches auto-merge; short ones stay separate; a
+    // human's split/merge overrides it, durably and reversibly.
+    #[pg_test]
+    fn gated_auto_merge_with_reversible_decisions() {
+        Spi::run("CREATE TABLE notes (id int PRIMARY KEY, owner text, body text)").unwrap();
+        Spi::run(
+            "INSERT INTO notes VALUES \
+             (1, 'amir', 'Khashayar'), (2, 'amir', 'خشایار'), \
+             (3, 'amir', 'Ali'), (4, 'amir', 'علی')",
+        )
+        .unwrap();
+        Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+
+        // Khashayar ~ خشایار auto-merge (distinctive); Ali / علی stay apart
+        // (too short for the gate). So: 1 merged + 2 = 3 entities.
+        assert_eq!(all_entities().len(), 3);
+
+        // Split reverses the auto-merge (applies immediately).
+        Spi::run("SELECT graphwright.split('notes', 'Khashayar', 'خشایار')").unwrap();
+        assert_eq!(all_entities().len(), 4);
+
+        // Merge the short pair the gate left alone.
+        Spi::run("SELECT graphwright.merge('notes', 'Ali', 'علی')").unwrap();
+        assert_eq!(all_entities().len(), 3);
+
+        // Dropping the split lets the auto-merge return.
+        Spi::run("SELECT graphwright.unmerge('notes', 'Khashayar', 'خشایار')").unwrap();
+        assert_eq!(all_entities().len(), 2);
     }
 }
 
