@@ -17,6 +17,9 @@ use pgrx::prelude::*;
 
 pgrx::pg_module_magic!(name, version);
 
+mod resolve;
+use resolve::normalize_name;
+
 fn lit(s: &str) -> String {
     pgrx::spi::quote_literal(s)
 }
@@ -315,11 +318,18 @@ fn resolve_tokens(watch_id: i32, source_pk: &str, tokens: &[String]) -> i64 {
     let mut ids: Vec<i64> = Vec::new();
     let mut mentions = 0i64;
     for tok in tokens {
+        // Exact resolution folds on the normalized key, so script and
+        // diacritic variants of a name meet as one entity.
+        let norm = normalize_name(tok);
+        if norm.is_empty() {
+            continue;
+        }
         let entity_id = Spi::get_one::<i64>(&format!(
-            "INSERT INTO graphwright.entity (watch_id, surface) VALUES ({watch_id}, {surf}) \
-             ON CONFLICT (watch_id, surface) DO UPDATE SET surface = EXCLUDED.surface \
+            "INSERT INTO graphwright.entity (watch_id, surface, norm) VALUES ({watch_id}, {surf}, {norm}) \
+             ON CONFLICT (watch_id, norm) DO UPDATE SET norm = EXCLUDED.norm \
              RETURNING id",
             surf = lit(tok),
+            norm = lit(&norm),
         ))
         .expect("entity upsert")
         .expect("entity id");
@@ -1123,7 +1133,8 @@ CREATE TABLE graphwright.entity (
     id       bigserial PRIMARY KEY,
     watch_id integer NOT NULL REFERENCES graphwright.watch(id) ON DELETE CASCADE,
     surface  text NOT NULL,
-    UNIQUE (watch_id, surface)
+    norm     text NOT NULL,
+    UNIQUE (watch_id, norm)
 );
 
 CREATE TABLE graphwright.mention (
@@ -1651,6 +1662,17 @@ mod tests {
 
         // The extractor yields sara/secret/tehran; the judge drops 'secret'.
         assert_eq!(all_entities(), vec!["sara", "tehran"]);
+    }
+
+    // Exact resolution folds on the normalized key, so the Arabic and
+    // Persian spellings of the same name become one entity.
+    #[pg_test]
+    fn normalization_folds_script_variants() {
+        Spi::run("CREATE TABLE notes (id int PRIMARY KEY, owner text, body text)").unwrap();
+        // 'علي' uses Arabic yeh, 'علی' Persian yeh: same name, different codepoints.
+        Spi::run("INSERT INTO notes VALUES (1, 'amir', 'علي'), (2, 'amir', 'علی')").unwrap();
+        Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+        assert_eq!(all_entities().len(), 1);
     }
 }
 
