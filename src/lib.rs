@@ -222,13 +222,14 @@ fn resolve_from_storage(indexrel: pg_sys::Relation, watch_id: i32) {
         .filter(|p| !split_set.contains(p))
         .collect();
     let canon = canonical_map(&norms, &merges);
+    let overrides = read_overrides(watch_id);
 
     Spi::run(&format!(
         "DELETE FROM graphwright.entity WHERE watch_id = {watch_id}"
     ))
     .expect("clear watch");
     for (ctid, surfaces) in &records {
-        resolve_tokens(watch_id, ctid, surfaces, &canon);
+        resolve_tokens(watch_id, ctid, surfaces, &canon, &overrides);
     }
 }
 
@@ -334,6 +335,67 @@ fn list_decisions(source_table: &str) -> Vec<(String, String, String)> {
         Ok::<_, pgrx::spi::Error>(out)
     })
     .unwrap_or_default()
+}
+
+// Per-mention overrides for a watch, keyed by (source_pk, surface_norm).
+fn read_overrides(watch_id: i32) -> std::collections::HashMap<(String, String), String> {
+    pgrx::Spi::connect(|client| {
+        let table = client.select(
+            &format!(
+                "SELECT source_pk, surface_norm, tag FROM graphwright.mention_override \
+                 WHERE watch_id = {watch_id}"
+            ),
+            None,
+            &[],
+        )?;
+        let mut out = std::collections::HashMap::new();
+        for row in table {
+            let pk = row.get::<String>(1)?.expect("source_pk");
+            let norm = row.get::<String>(2)?.expect("surface_norm");
+            let tag = row.get::<String>(3)?.expect("tag");
+            out.insert((pk, norm), tag);
+        }
+        Ok::<_, pgrx::spi::Error>(out)
+    })
+    .unwrap_or_default()
+}
+
+// Pin one surface occurrence in one row to a private entity, then re-resolve.
+// The tag groups occurrences into the same private entity; empty defaults to
+// the row, so each split stands alone. Reversible: drop_mention_override.
+fn record_mention_override(source_table: &str, source_pk: &str, surface: &str, tag: &str) -> bool {
+    let wid = watch_id_of(source_table);
+    let norm = normalize_name(surface);
+    if norm.is_empty() {
+        return false;
+    }
+    let tag = if tag.is_empty() { source_pk } else { tag };
+    pgrx::Spi::run(&format!(
+        "INSERT INTO graphwright.mention_override (watch_id, source_pk, surface_norm, tag) \
+         VALUES ({wid}, {pk}, {norm}, {tag}) \
+         ON CONFLICT (watch_id, source_pk, surface_norm) \
+         DO UPDATE SET tag = EXCLUDED.tag, decided_by = current_user, decided_at = now()",
+        pk = lit(source_pk),
+        norm = lit(&norm),
+        tag = lit(tag),
+    ))
+    .expect("record mention override");
+    drain_all();
+    true
+}
+
+fn drop_mention_override(source_table: &str, source_pk: &str, surface: &str) -> bool {
+    let wid = watch_id_of(source_table);
+    let norm = normalize_name(surface);
+    pgrx::Spi::run(&format!(
+        "DELETE FROM graphwright.mention_override \
+         WHERE watch_id = {wid} AND source_pk = {pk} AND surface_norm = {norm}",
+        pk = lit(source_pk),
+        norm = lit(&norm),
+    ))
+    .expect("drop mention override");
+    drain_all();
+    true
 }
 
 // Extract every pending row (markers in index storage), writing the
@@ -445,6 +507,7 @@ fn index_row(watch_id: i32, source_pk: &str, body: &str) -> i64 {
         source_pk,
         &extract(body),
         &std::collections::HashMap::new(),
+        &read_overrides(watch_id),
     )
 }
 
@@ -456,6 +519,7 @@ fn resolve_tokens(
     source_pk: &str,
     tokens: &[String],
     canon: &std::collections::HashMap<String, String>,
+    overrides: &std::collections::HashMap<(String, String), String>,
 ) -> i64 {
     use pgrx::Spi;
     let mut ids: Vec<i64> = Vec::new();
@@ -467,13 +531,19 @@ fn resolve_tokens(
         if norm.is_empty() {
             continue;
         }
-        let key = canon.get(&norm).cloned().unwrap_or(norm);
+        let canon_key = canon.get(&norm).cloned().unwrap_or_else(|| norm.clone());
+        // A per-mention override forks this one occurrence onto a private
+        // key, so a human can separate it from the exact-folded entity.
+        let entity_key = match overrides.get(&(source_pk.to_string(), norm)) {
+            Some(tag) => format!("{canon_key}{OVERRIDE_SEP}{tag}"),
+            None => canon_key,
+        };
         let entity_id = Spi::get_one::<i64>(&format!(
             "INSERT INTO graphwright.entity (watch_id, surface, norm) VALUES ({watch_id}, {surf}, {norm}) \
              ON CONFLICT (watch_id, norm) DO UPDATE SET norm = EXCLUDED.norm \
              RETURNING id",
             surf = lit(tok),
-            norm = lit(&key),
+            norm = lit(&entity_key),
         ))
         .expect("entity upsert")
         .expect("entity id");
@@ -624,6 +694,10 @@ fn process_dirty(watch_id: i32) -> i64 {
 
 pub const MARKER: u8 = 0;
 pub const MENTIONS: u8 = 1;
+
+// Separator joining a canonical norm to an override tag for a private
+// entity key. ASCII Unit Separator never appears in a normalized name.
+const OVERRIDE_SEP: char = '\u{1f}';
 
 mod storage {
     use pgrx::pg_sys;
@@ -1319,6 +1393,21 @@ CREATE TABLE graphwright.mention (
     surface_form text NOT NULL
 );
 
+-- Per-mention identity override: pins one surface occurrence in one row to
+-- a private entity, even when it normalizes to a shared key. This is how a
+-- human separates two identical spellings the exact stage folded into one.
+-- Delete the row to fold them back. The tag groups occurrences that should
+-- share the same private entity (default: the row, so each split is its own).
+CREATE TABLE graphwright.mention_override (
+    watch_id     integer NOT NULL REFERENCES graphwright.watch(id) ON DELETE CASCADE,
+    source_pk    text NOT NULL,
+    surface_norm text NOT NULL,
+    tag          text NOT NULL,
+    decided_by   text NOT NULL DEFAULT current_user,
+    decided_at   timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (watch_id, source_pk, surface_norm)
+);
+
 CREATE TABLE graphwright.edge (
     id        bigserial PRIMARY KEY,
     watch_id  integer NOT NULL REFERENCES graphwright.watch(id) ON DELETE CASCADE,
@@ -1552,6 +1641,70 @@ GRANT SELECT ON ALL TABLES IN SCHEMA graphwright TO PUBLIC;
         ),
     > {
         TableIterator::new(super::list_decisions(source_table))
+    }
+
+    // Per-mention identity override. split_mention pins one surface
+    // occurrence in one row (source_pk, e.g. its ctid) to a private entity,
+    // separating two identical spellings the exact stage folded. tag groups
+    // splits that should share one private entity (NULL: the row stands
+    // alone). unsplit_mention drops it, folding them back. Both re-resolve.
+    #[pg_extern]
+    fn split_mention(
+        source_table: &str,
+        source_pk: &str,
+        surface: &str,
+        tag: default!(Option<&str>, "NULL"),
+    ) -> bool {
+        super::record_mention_override(source_table, source_pk, surface, tag.unwrap_or(""))
+    }
+
+    #[pg_extern]
+    fn unsplit_mention(source_table: &str, source_pk: &str, surface: &str) -> bool {
+        super::drop_mention_override(source_table, source_pk, surface)
+    }
+
+    // Mentions visible to the caller: the raw occurrences behind the graph,
+    // with the source row's pk (for split_mention) and resolved entity. The
+    // join to the source table runs as the caller, so RLS filters it.
+    #[pg_extern]
+    fn mentions(
+        source_table: &str,
+    ) -> TableIterator<
+        'static,
+        (
+            name!(entity_id, i64),
+            name!(surface, String),
+            name!(source_pk, String),
+            name!(surface_form, String),
+        ),
+    > {
+        let m = watch_meta(source_table);
+        let sql = format!(
+            "SELECT mn.entity_id, e.surface, mn.source_pk, mn.surface_form \
+             FROM graphwright.mention mn \
+             JOIN graphwright.entity e ON e.id = mn.entity_id \
+             JOIN {tbl} s ON (s.{pk})::text = mn.source_pk \
+             WHERE mn.watch_id = {wid} \
+             ORDER BY e.surface, mn.source_pk, mn.surface_form",
+            wid = m.id,
+            tbl = m.source_table,
+            pk = ident(&m.pk_column),
+        );
+        let rows: Vec<(i64, String, String, String)> = Spi::connect(|client| {
+            let table = client.select(&sql, None, &[])?;
+            let mut out = Vec::new();
+            for row in table {
+                out.push((
+                    row.get::<i64>(1)?.expect("entity id"),
+                    row.get::<String>(2)?.expect("surface"),
+                    row.get::<String>(3)?.expect("source_pk"),
+                    row.get::<String>(4)?.expect("surface_form"),
+                ));
+            }
+            Ok::<_, pgrx::spi::Error>(out)
+        })
+        .expect("mentions query");
+        TableIterator::new(rows)
     }
 
     // Edges visible to the caller. Visibility derives from the supporting
@@ -2018,6 +2171,36 @@ mod tests {
         Spi::run("SELECT graphwright.split('notes', 'Shahrbanoodeylam', 'Shahrbanoodeylan')")
             .unwrap();
         assert_eq!(all_entities().len(), 2);
+    }
+
+    // Two people share a spelling, so the exact stage folds them into one
+    // entity. A per-mention split separates the occurrence in one row, even
+    // though the surfaces normalize identically; dropping it folds them back.
+    #[pg_test]
+    fn per_mention_split_separates_identical_spellings() {
+        Spi::run("CREATE TABLE notes (id int PRIMARY KEY, owner text, body text)").unwrap();
+        Spi::run("INSERT INTO notes VALUES (1, 'amir', 'Sara'), (2, 'amir', 'Sara')").unwrap();
+        Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+
+        // Exact fold: two identical surfaces, one entity.
+        assert_eq!(all_entities(), vec!["sara"]);
+
+        // Split the second row's occurrence onto its own entity.
+        let pk = Spi::get_one::<String>("SELECT (ctid)::text FROM notes WHERE id = 2")
+            .unwrap()
+            .unwrap();
+        Spi::run(&format!(
+            "SELECT graphwright.split_mention('notes', '{pk}', 'Sara')"
+        ))
+        .unwrap();
+        assert_eq!(all_entities().len(), 2);
+
+        // Reverse it: back to one.
+        Spi::run(&format!(
+            "SELECT graphwright.unsplit_mention('notes', '{pk}', 'Sara')"
+        ))
+        .unwrap();
+        assert_eq!(all_entities(), vec!["sara"]);
     }
 }
 
