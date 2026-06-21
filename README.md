@@ -8,9 +8,7 @@ This is the Postgres-native sibling of [graphwright](https://github.com/hoofader
 
 ## Status
 
-Early, but the storage model is now the Postgres-native one. `CREATE INDEX ... USING graphwright (body)` stores each row's extraction in the **index relation's own pages** (WAL-logged through generic WAL, like pg_search), so it is transactional with the heap and travels with physical replication. `aminsert` keeps that storage current on writes. The cross-row resolved graph (entities/edges) is derived from index storage into catalog tables, refreshed by `graphwright.maintain()`; the accessors filter it per user against the source table's RLS. Extraction is still a deterministic stub (tokenize a row, co-mention edges). The pieces still to come:
-
-- `ambulkdelete` to reclaim deleted rows' records on vacuum (until then the RLS probe still hides deleted rows, except under ctid reuse),
+Early, but the storage model is now the Postgres-native one. `CREATE INDEX ... USING graphwright (body)` stores each row's extraction in the **index relation's own pages** (WAL-logged through generic WAL, like pg_search), so it is transactional with the heap and travels with physical replication. `aminsert` keeps that storage current on writes, and `ambulkdelete` reclaims deleted rows' records on vacuum. The cross-row resolved graph (entities/edges) is derived from index storage into catalog tables, refreshed by `graphwright.maintain()`; the accessors filter it per user against the source table's RLS. Extraction is still a deterministic stub (tokenize a row, co-mention edges). The pieces still to come:
 
 - a real extraction seam (a local LLM / GLiNER via graphwright-onnx, judged by a larger model),
 - the resolution cascade (phonetic, fuzzy, embedding) ported from the graphwright core,

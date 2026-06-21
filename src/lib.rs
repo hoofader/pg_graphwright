@@ -457,6 +457,113 @@ mod storage {
         }
         out
     }
+
+    // Mark dead every record whose heap ctid `is_dead` rejects, WAL-logged.
+    // Returns the number removed. (LP_DEAD makes scan skip it, so the record
+    // can no longer be resolved, even if a future row reuses that ctid.)
+    pub unsafe fn prune(
+        indexrel: pg_sys::Relation,
+        is_dead: &mut dyn FnMut(u32, u16) -> bool,
+    ) -> u64 {
+        let fork = pg_sys::ForkNumber::MAIN_FORKNUM;
+        let nblocks = pg_sys::RelationGetNumberOfBlocksInFork(indexrel, fork);
+        let mut removed = 0u64;
+        for blk in 0..nblocks {
+            let buf = pg_sys::ReadBufferExtended(
+                indexrel,
+                fork,
+                blk,
+                pg_sys::ReadBufferMode::RBM_NORMAL,
+                std::ptr::null_mut(),
+            );
+            pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
+            let state = pg_sys::GenericXLogStart(indexrel);
+            let pg = pg_sys::GenericXLogRegisterBuffer(state, buf, 0);
+            let mut changed = false;
+            if !is_new(pg) {
+                let maxoff = pg_sys::PageGetMaxOffsetNumber(pg);
+                let mut off = FIRST_OFFSET;
+                while off <= maxoff {
+                    let iid = pg_sys::PageGetItemId(pg, off);
+                    if (*iid).lp_flags() == pg_sys::LP_NORMAL {
+                        let item = pg_sys::PageGetItem(pg, iid) as *const u8;
+                        let len = (*iid).lp_len() as usize;
+                        let (block, offset, _) = decode(std::slice::from_raw_parts(item, len));
+                        if is_dead(block, offset) {
+                            (*iid).set_lp_flags(pg_sys::LP_DEAD);
+                            (*iid).set_lp_off(0);
+                            (*iid).set_lp_len(0);
+                            removed += 1;
+                            changed = true;
+                        }
+                    }
+                    off += 1;
+                }
+            }
+            if changed {
+                pg_sys::GenericXLogFinish(state);
+            } else {
+                pg_sys::GenericXLogAbort(state);
+            }
+            pg_sys::UnlockReleaseBuffer(buf);
+        }
+        removed
+    }
+}
+
+// Garbage-collect index storage: drop records whose heap row no longer
+// exists. Must run privileged (it checks heap liveness; an RLS-limited
+// view would wrongly prune rows it cannot see). ambulkdelete does the same
+// during vacuum, driven by the vacuum callback instead of a heap probe.
+fn gc(index: &str) -> i64 {
+    use pgrx::Spi;
+    let index_oid = Spi::get_one::<pg_sys::Oid>(&format!("SELECT {}::regclass::oid", lit(index)))
+        .expect("index oid")
+        .expect("index oid");
+    let heap = Spi::get_one::<String>(&format!(
+        "SELECT indrelid::regclass::text FROM pg_index WHERE indexrelid = {}::oid",
+        index_oid.to_u32()
+    ))
+    .expect("heap lookup")
+    .expect("heap");
+
+    // Pass 1: collect stored ctids under a share lock only.
+    let ctids: Vec<(u32, u16)> = unsafe {
+        let rel = pg_sys::relation_open(index_oid, pg_sys::AccessShareLock as i32);
+        let recs = storage::scan(rel);
+        pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+        recs.iter()
+            .map(|r| {
+                let (b, o, _) = storage::decode(r);
+                (b, o)
+            })
+            .collect()
+    };
+
+    // Pass 2: which ctids no longer point at a live heap row? (No buffer
+    // lock held while probing the heap.)
+    let mut dead = std::collections::HashSet::new();
+    for (b, o) in &ctids {
+        let live = Spi::get_one::<bool>(&format!(
+            "SELECT EXISTS (SELECT 1 FROM {heap} WHERE ctid = '({b},{o})'::tid)"
+        ))
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+        if !live {
+            dead.insert((*b, *o));
+        }
+    }
+
+    // Pass 3: prune them from storage.
+    let removed = unsafe {
+        let rel = pg_sys::relation_open(index_oid, pg_sys::RowExclusiveLock as i32);
+        let mut pred = |b: u32, o: u16| dead.contains(&(b, o));
+        let n = storage::prune(rel, &mut pred);
+        pg_sys::relation_close(rel, pg_sys::RowExclusiveLock as i32);
+        n
+    };
+    removed as i64
 }
 
 // Open an index by name, read back its stored per-row tokens. Lets a test
@@ -587,18 +694,35 @@ pub unsafe extern "C-unwind" fn aminsert(
     false
 }
 
+// Vacuum is removing some heap tuples; drop their records from index
+// storage so a reused ctid can never resolve against a stale record.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn ambulkdelete(
-    _info: *mut pg_sys::IndexVacuumInfo,
+    info: *mut pg_sys::IndexVacuumInfo,
     stats: *mut pg_sys::IndexBulkDeleteResult,
-    _callback: pg_sys::IndexBulkDeleteCallback,
-    _callback_state: *mut c_void,
+    callback: pg_sys::IndexBulkDeleteCallback,
+    callback_state: *mut c_void,
 ) -> *mut pg_sys::IndexBulkDeleteResult {
-    if stats.is_null() {
+    let stats = if stats.is_null() {
         pgrx::PgBox::<pg_sys::IndexBulkDeleteResult>::alloc0().into_pg()
     } else {
         stats
+    };
+    if let Some(cb) = callback {
+        let mut is_dead = |block: u32, offset: u16| -> bool {
+            let mut tid = pg_sys::ItemPointerData {
+                ip_blkid: pg_sys::BlockIdData {
+                    bi_hi: (block >> 16) as u16,
+                    bi_lo: (block & 0xffff) as u16,
+                },
+                ip_posid: offset,
+            };
+            cb(&mut tid as *mut _, callback_state)
+        };
+        let removed = storage::prune((*info).index, &mut is_dead);
+        (*stats).tuples_removed += removed as f64;
     }
+    stats
 }
 
 #[pg_guard]
@@ -958,6 +1082,14 @@ GRANT SELECT ON ALL TABLES IN SCHEMA graphwright TO PUBLIC;
         TableIterator::new(super::index_dump(index))
     }
 
+    // Reclaim storage records for rows that no longer exist (vacuum does
+    // this automatically via ambulkdelete). Returns the number removed.
+    // Run as a role that can see every row.
+    #[pg_extern]
+    fn gc(index: &str) -> i64 {
+        super::gc(index)
+    }
+
     // Entities visible to the caller: those mentioned by at least one
     // source row the caller can read. The EXISTS probe joins the source
     // table, so RLS filters it.
@@ -1283,6 +1415,36 @@ mod tests {
         assert!(rows
             .iter()
             .any(|s| s.contains("reza") && s.contains("berlin")));
+    }
+
+    // gc() (and ambulkdelete) reclaims storage records for deleted rows,
+    // closing the ctid-reuse gap.
+    #[pg_test]
+    fn gc_reclaims_deleted_rows_from_storage() {
+        Spi::run("CREATE TABLE notes (id int PRIMARY KEY, owner text, body text)").unwrap();
+        Spi::run("INSERT INTO notes VALUES (1, 'amir', 'Sara Tehran'), (2, 'amir', 'Reza Berlin')")
+            .unwrap();
+        Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+        let count = || {
+            Spi::get_one::<i64>("SELECT count(*) FROM graphwright.index_dump('notes_kg')")
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(count(), 2);
+
+        Spi::run("DELETE FROM notes WHERE id = 2").unwrap();
+        let removed = Spi::get_one::<i64>("SELECT graphwright.gc('notes_kg')")
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(count(), 1);
+
+        let surviving = Spi::get_one::<String>(
+            "SELECT array_to_string(tokens, ',') FROM graphwright.index_dump('notes_kg')",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(surviving.contains("sara") && surviving.contains("tehran"));
     }
 }
 
