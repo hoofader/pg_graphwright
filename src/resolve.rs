@@ -367,3 +367,108 @@ pub fn gated_phonetic_pairs(norms: &HashSet<String>) -> Vec<(String, String)> {
     }
     pairs.into_iter().collect()
 }
+
+// ─── fuzzy (3-gram Jaccard) ─────────────────────────────────────────
+//
+// Character-shingle similarity, ported from the TS core's minhash.ts.
+// Catches typo/transposition variants that the consonant skeletons miss
+// (a changed consonant forks the phonetic key but barely moves Jaccard).
+
+const SHINGLE_SIZE: usize = 3;
+const FUZZY_THRESHOLD: f64 = 0.82;
+
+fn shingles(s: &str) -> HashSet<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = HashSet::new();
+    if chars.is_empty() {
+        return out;
+    }
+    if chars.len() <= SHINGLE_SIZE {
+        out.insert(s.to_string());
+        return out;
+    }
+    for w in chars.windows(SHINGLE_SIZE) {
+        out.insert(w.iter().collect());
+    }
+    out
+}
+
+fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    let inter = small.iter().filter(|x| large.contains(*x)).count();
+    inter as f64 / (a.len() + b.len() - inter) as f64
+}
+
+/// Norm pairs (sorted) within the Jaccard threshold on 3-gram shingles,
+/// limited to names distinctive enough to pass the entropy gate. All-pairs
+/// (O(n^2)); past a few hundred norms an LSH band prefilter would replace
+/// the inner scan (minhash.ts has the band keys to port when that bites).
+pub fn gated_fuzzy_pairs(norms: &HashSet<String>) -> Vec<(String, String)> {
+    let gated: Vec<(&String, HashSet<String>)> = norms
+        .iter()
+        .filter(|n| passes_entropy_gate(n))
+        .map(|n| (n, shingles(n)))
+        .collect();
+    let mut pairs = Vec::new();
+    for i in 0..gated.len() {
+        for j in (i + 1)..gated.len() {
+            if jaccard(&gated[i].1, &gated[j].1) >= FUZZY_THRESHOLD {
+                let (a, b) = (gated[i].0, gated[j].0);
+                let (lo, hi) = if a <= b {
+                    (a.clone(), b.clone())
+                } else {
+                    (b.clone(), a.clone())
+                };
+                pairs.push((lo, hi));
+            }
+        }
+    }
+    pairs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(xs: &[&str]) -> HashSet<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn jaccard_is_one_on_identity_zero_on_disjoint() {
+        let a = shingles("esfandiyar");
+        assert_eq!(jaccard(&a, &a), 1.0);
+        assert_eq!(jaccard(&shingles("abcdef"), &shingles("uvwxyz")), 0.0);
+    }
+
+    #[test]
+    fn fuzzy_catches_a_consonant_typo_that_phonetic_forks() {
+        // Same name, last consonant differs: the phonetic skeletons fork
+        // (…m vs …n), so only the fuzzy lane (Jaccard ~0.87) links them.
+        let norms = set(&["shahrbanoodeylam", "shahrbanoodeylan"]);
+        assert!(gated_phonetic_pairs(&norms).is_empty());
+        let fuzzy = gated_fuzzy_pairs(&norms);
+        assert_eq!(fuzzy.len(), 1);
+        assert_eq!(
+            fuzzy[0],
+            (
+                "shahrbanoodeylam".to_string(),
+                "shahrbanoodeylan".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn fuzzy_respects_the_threshold_and_the_entropy_gate() {
+        // Distinctive but only ~0.56 Jaccard: below the bar, no merge.
+        assert!(gated_fuzzy_pairs(&set(&["khorasani", "khorasari"])).is_empty());
+        // Near-identical but low-entropy (short): the gate drops it.
+        assert!(gated_fuzzy_pairs(&set(&["anna", "anaa"])).is_empty());
+    }
+}

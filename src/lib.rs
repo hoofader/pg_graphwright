@@ -18,7 +18,9 @@ use pgrx::prelude::*;
 pgrx::pg_module_magic!(name, version);
 
 mod resolve;
-use resolve::{canonical_map, gated_phonetic_pairs, normalize_name, phonetic_keys};
+use resolve::{
+    canonical_map, gated_fuzzy_pairs, gated_phonetic_pairs, normalize_name, phonetic_keys,
+};
 use std::collections::HashSet;
 
 fn lit(s: &str) -> String {
@@ -216,6 +218,7 @@ fn resolve_from_storage(indexrel: pg_sys::Relation, watch_id: i32) {
     let merges: Vec<(String, String)> = manual
         .into_iter()
         .chain(gated_phonetic_pairs(&norms))
+        .chain(gated_fuzzy_pairs(&norms))
         .filter(|p| !split_set.contains(p))
         .collect();
     let canon = canonical_map(&norms, &merges);
@@ -1994,6 +1997,26 @@ mod tests {
 
         // Dropping the split lets the auto-merge return.
         Spi::run("SELECT graphwright.unmerge('notes', 'Khashayar', 'خشایار')").unwrap();
+        assert_eq!(all_entities().len(), 2);
+    }
+
+    // A distinctive typo variant the phonetic skeleton forks on still
+    // auto-merges through the fuzzy lane, and stays reversible.
+    #[pg_test]
+    fn gated_fuzzy_auto_merge_is_reversible() {
+        Spi::run("CREATE TABLE notes (id int PRIMARY KEY, owner text, body text)").unwrap();
+        Spi::run(
+            "INSERT INTO notes VALUES \
+             (1, 'sina', 'Shahrbanoodeylam'), (2, 'sina', 'Shahrbanoodeylan')",
+        )
+        .unwrap();
+        Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+
+        // ~0.87 Jaccard, both past the gate: one entity.
+        assert_eq!(all_entities().len(), 1);
+
+        Spi::run("SELECT graphwright.split('notes', 'Shahrbanoodeylam', 'Shahrbanoodeylan')")
+            .unwrap();
         assert_eq!(all_entities().len(), 2);
     }
 }
