@@ -432,12 +432,66 @@ pub fn gated_fuzzy_pairs(norms: &HashSet<String>) -> Vec<(String, String)> {
     pairs
 }
 
+// ─── embedding (cosine over an injected embedder) ───────────────────
+//
+// The semantic rescue lane: it merges names the lexical gate dropped
+// (short, low-entropy) when their vectors are close. Vectors come from
+// the graphwright.embedder seam; this is the pure scoring half. Not
+// entropy-gated, on purpose — rescuing short names is the whole point.
+
+fn cosine(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let (mut dot, mut na, mut nb) = (0.0, 0.0, 0.0);
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
+/// Norm pairs (sorted) whose embeddings are within the cosine threshold.
+/// All-pairs O(n^2) over the supplied vectors.
+pub fn embedding_pairs(vectors: &[(String, Vec<f64>)], threshold: f64) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for i in 0..vectors.len() {
+        for j in (i + 1)..vectors.len() {
+            if cosine(&vectors[i].1, &vectors[j].1) >= threshold {
+                let (a, b) = (&vectors[i].0, &vectors[j].0);
+                let (lo, hi) = if a <= b {
+                    (a.clone(), b.clone())
+                } else {
+                    (b.clone(), a.clone())
+                };
+                pairs.push((lo, hi));
+            }
+        }
+    }
+    pairs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn set(xs: &[&str]) -> HashSet<String> {
         xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn embedding_merges_only_close_vectors() {
+        let v = vec![
+            ("ali".to_string(), vec![1.0, 0.0]),
+            ("علی".to_string(), vec![0.98, 0.2]),
+            ("reza".to_string(), vec![0.0, 1.0]),
+        ];
+        let pairs = embedding_pairs(&v, 0.83);
+        assert_eq!(pairs, vec![("ali".to_string(), "علی".to_string())]);
     }
 
     #[test]

@@ -114,6 +114,34 @@ fn judge(text: &str, surfaces: Vec<String>) -> Vec<String> {
     }
 }
 
+// The embedding seam: graphwright.embedder names a function
+// `f(text) -> float8[]`. It embeds each norm and merges pairs whose cosine
+// clears graphwright.embedding_threshold, rescuing short names the lexical
+// gate dropped. Empty seam leaves the deterministic behavior unchanged.
+fn embed_pairs(norms: &HashSet<String>) -> Vec<(String, String)> {
+    let Some(name) = EMBEDDER.get() else {
+        return Vec::new();
+    };
+    let name = name.to_string_lossy().trim().to_string();
+    if name.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted: Vec<&String> = norms.iter().collect();
+    sorted.sort();
+    let mut vectors: Vec<(String, Vec<f64>)> = Vec::new();
+    for n in sorted {
+        let vec = pgrx::Spi::get_one::<Vec<Option<f64>>>(&format!("SELECT {}({})", name, lit(n)))
+            .ok()
+            .flatten()
+            .map(|xs| xs.into_iter().flatten().collect::<Vec<f64>>())
+            .unwrap_or_default();
+        if !vec.is_empty() {
+            vectors.push((n.clone(), vec));
+        }
+    }
+    resolve::embedding_pairs(&vectors, EMBEDDING_THRESHOLD.get())
+}
+
 enum Visibility {
     Union,
     Intersection,
@@ -219,6 +247,7 @@ fn resolve_from_storage(indexrel: pg_sys::Relation, watch_id: i32) {
         .into_iter()
         .chain(gated_phonetic_pairs(&norms))
         .chain(gated_fuzzy_pairs(&norms))
+        .chain(embed_pairs(&norms))
         .filter(|p| !split_set.contains(p))
         .collect();
     let canon = canonical_map(&norms, &merges);
@@ -1214,6 +1243,8 @@ use std::time::Duration;
 static MAINTENANCE_DATABASE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 static EXTRACTOR: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 static JUDGE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+static EMBEDDER: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+static EMBEDDING_THRESHOLD: GucSetting<f64> = GucSetting::<f64>::new(0.83);
 
 // Bring every graphwright graph current: re-resolve each index from its
 // own storage (the index path), and drain the change queue (the no-index
@@ -1303,6 +1334,24 @@ pub extern "C-unwind" fn _PG_init() {
         c"SQL function j(text, text[]) -> text[] that validates the extractor output.",
         c"Empty applies no judge. A larger model can drop or keep mentions here.",
         &JUDGE,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"graphwright.embedder",
+        c"SQL function f(text) -> float8[] that embeds a name for semantic matching.",
+        c"Empty disables the embedding lane. Names whose vectors are close auto-merge.",
+        &EMBEDDER,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_float_guc(
+        c"graphwright.embedding_threshold",
+        c"Cosine at or above which two embedded names auto-merge.",
+        c"Default 0.83. Higher is stricter. Only used when graphwright.embedder is set.",
+        &EMBEDDING_THRESHOLD,
+        0.0,
+        1.0,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -2201,6 +2250,36 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(all_entities(), vec!["sara"]);
+    }
+
+    // The embedding lane rescues short names the entropy gate keeps out of
+    // the lexical lanes, and the merge is reversible like any other.
+    #[pg_test]
+    fn embedding_rescues_a_short_name_the_gate_drops() {
+        Spi::run("CREATE TABLE notes (id int PRIMARY KEY, owner text, body text)").unwrap();
+        Spi::run(
+            "INSERT INTO notes VALUES (1, 'amir', 'Ali'), (2, 'amir', 'علی'), (3, 'amir', 'Reza')",
+        )
+        .unwrap();
+        Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+
+        // Ali / علی are too short for the lexical gate: three entities.
+        assert_eq!(all_entities().len(), 3);
+
+        // An embedder that maps both spellings of Ali to one vector merges
+        // them, where fuzzy and phonetic were not allowed to look.
+        Spi::run(
+            "CREATE FUNCTION test_embed(t text) RETURNS float8[] LANGUAGE sql IMMUTABLE AS $$ \
+             SELECT CASE WHEN t IN ('ali', 'علی') THEN ARRAY[1.0, 0.0] ELSE ARRAY[0.0, 1.0] END $$",
+        )
+        .unwrap();
+        Spi::run("SET graphwright.embedder = 'test_embed'").unwrap();
+        Spi::run("SELECT graphwright.maintain()").unwrap();
+        assert_eq!(all_entities().len(), 2);
+
+        // Reversible: a split vetoes the embedding merge.
+        Spi::run("SELECT graphwright.split('notes', 'Ali', 'علی')").unwrap();
+        assert_eq!(all_entities().len(), 3);
     }
 }
 
