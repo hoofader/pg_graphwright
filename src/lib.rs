@@ -18,7 +18,7 @@ use pgrx::prelude::*;
 pgrx::pg_module_magic!(name, version);
 
 mod resolve;
-use resolve::normalize_name;
+use resolve::{normalize_name, phonetic_keys};
 
 fn lit(s: &str) -> String {
     pgrx::spi::quote_literal(s)
@@ -333,6 +333,14 @@ fn resolve_tokens(watch_id: i32, source_pk: &str, tokens: &[String]) -> i64 {
         ))
         .expect("entity upsert")
         .expect("entity id");
+        for key in phonetic_keys(tok) {
+            Spi::run(&format!(
+                "INSERT INTO graphwright.entity_phonetic (entity_id, key) VALUES ({entity_id}, {k}) \
+                 ON CONFLICT DO NOTHING",
+                k = lit(&key),
+            ))
+            .expect("phonetic key insert");
+        }
         Spi::run(&format!(
             "INSERT INTO graphwright.mention (watch_id, entity_id, source_pk, surface_form) \
              VALUES ({watch_id}, {entity_id}, {pk}, {sf})",
@@ -1137,6 +1145,14 @@ CREATE TABLE graphwright.entity (
     UNIQUE (watch_id, norm)
 );
 
+-- An entity's phonetic keys (cross-script consonant skeletons). Two
+-- entities that share a key are a merge proposal, not an auto-merge.
+CREATE TABLE graphwright.entity_phonetic (
+    entity_id bigint NOT NULL REFERENCES graphwright.entity(id) ON DELETE CASCADE,
+    key       text NOT NULL,
+    PRIMARY KEY (entity_id, key)
+);
+
 CREATE TABLE graphwright.mention (
     id           bigserial PRIMARY KEY,
     watch_id     integer NOT NULL REFERENCES graphwright.watch(id) ON DELETE CASCADE,
@@ -1288,6 +1304,62 @@ GRANT SELECT ON ALL TABLES IN SCHEMA graphwright TO PUBLIC;
             Ok::<_, pgrx::spi::Error>(out)
         })
         .expect("entities query");
+        TableIterator::new(rows)
+    }
+
+    // Merge proposals: pairs of visible entities that share a phonetic key
+    // (cross-script or spelling variants) but did not fold at the exact
+    // stage. These are candidates for review, never auto-merged. Both
+    // entities must be visible to the caller, so the RLS probe runs twice.
+    #[pg_extern]
+    fn proposals(
+        source_table: &str,
+    ) -> TableIterator<
+        'static,
+        (
+            name!(entity_a, i64),
+            name!(surface_a, String),
+            name!(entity_b, i64),
+            name!(surface_b, String),
+        ),
+    > {
+        let m = watch_meta(source_table);
+        let visible = |alias: &str| {
+            format!(
+                "EXISTS (SELECT 1 FROM graphwright.mention mn \
+                 JOIN {tbl} s ON (s.{pk})::text = mn.source_pk WHERE mn.entity_id = {alias}.id)",
+                tbl = m.source_table,
+                pk = ident(&m.pk_column),
+            )
+        };
+        let sql = format!(
+            "SELECT e1.id, e1.surface, e2.id, e2.surface \
+             FROM graphwright.entity_phonetic p1 \
+             JOIN graphwright.entity_phonetic p2 ON p1.key = p2.key AND p1.entity_id < p2.entity_id \
+             JOIN graphwright.entity e1 ON e1.id = p1.entity_id \
+             JOIN graphwright.entity e2 ON e2.id = p2.entity_id \
+             WHERE e1.watch_id = {wid} AND e2.watch_id = {wid} AND e1.norm <> e2.norm \
+               AND {vis_a} AND {vis_b} \
+             GROUP BY e1.id, e1.surface, e2.id, e2.surface \
+             ORDER BY e1.surface, e2.surface",
+            wid = m.id,
+            vis_a = visible("e1"),
+            vis_b = visible("e2"),
+        );
+        let rows: Vec<(i64, String, i64, String)> = Spi::connect(|client| {
+            let table = client.select(&sql, None, &[])?;
+            let mut out = Vec::new();
+            for row in table {
+                out.push((
+                    row.get::<i64>(1)?.expect("entity a"),
+                    row.get::<String>(2)?.expect("surface a"),
+                    row.get::<i64>(3)?.expect("entity b"),
+                    row.get::<String>(4)?.expect("surface b"),
+                ));
+            }
+            Ok::<_, pgrx::spi::Error>(out)
+        })
+        .expect("proposals query");
         TableIterator::new(rows)
     }
 
@@ -1673,6 +1745,38 @@ mod tests {
         Spi::run("INSERT INTO notes VALUES (1, 'amir', 'علي'), (2, 'amir', 'علی')").unwrap();
         Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
         assert_eq!(all_entities().len(), 1);
+    }
+
+    // Phonetic keys propose a cross-script match that exact resolution
+    // cannot reach: 'Faeze' (Latin) and 'فائزه' (Persian) share no
+    // characters but the same consonant skeleton.
+    #[pg_test]
+    fn phonetic_proposals_bridge_scripts() {
+        Spi::run("CREATE TABLE notes (id int PRIMARY KEY, owner text, body text)").unwrap();
+        Spi::run("INSERT INTO notes VALUES (1, 'amir', 'Faeze'), (2, 'amir', 'فائزه')").unwrap();
+        Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+
+        let pairs: Vec<(String, String)> = Spi::connect(|client| {
+            let table = client.select(
+                "SELECT surface_a, surface_b FROM graphwright.proposals('notes')",
+                None,
+                &[],
+            )?;
+            let mut v = Vec::new();
+            for row in table {
+                v.push((
+                    row.get::<String>(1)?.unwrap(),
+                    row.get::<String>(2)?.unwrap(),
+                ));
+            }
+            Ok::<_, pgrx::spi::Error>(v)
+        })
+        .unwrap();
+
+        assert_eq!(pairs.len(), 1);
+        let (a, b) = &pairs[0];
+        assert!(a == "faeze" || b == "faeze");
+        assert!(a == "فائزه" || b == "فائزه");
     }
 }
 
