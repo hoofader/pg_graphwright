@@ -8,9 +8,9 @@ This is the Postgres-native sibling of [graphwright](https://github.com/hoofader
 
 ## Status
 
-Early, but the storage model is now the Postgres-native one. `CREATE INDEX ... USING graphwright (body)` stores each row's extraction in the **index relation's own pages** (WAL-logged through generic WAL, like pg_search), so it is transactional with the heap and travels with physical replication. `aminsert` writes only a tiny marker on a write; the extractor and judge run asynchronously off the writing transaction, so a slow model never blocks a write. `ambulkdelete` reclaims deleted rows' records on vacuum. The cross-row resolved graph (entities/edges) is derived from index storage into catalog tables, refreshed by `graphwright.maintain()`; the accessors filter it per user against the source table's RLS. Extraction and judging are pluggable seams (`graphwright.extractor`, `graphwright.judge`), defaulting to a built-in tokenizer and no judge. Resolution folds entity surfaces on a normalized key (Arabic/Persian variants meet), and auto-merges distinctive cross-script phonetic matches (gated by entropy). It never waits: every identity decision is recorded in a durable, reversible decision log a human edits after the fact (SAGA-style), and `graphwright.proposals()` shows the matches the gate left for review. The pieces still to come:
+Early, but the storage model is now the Postgres-native one. `CREATE INDEX ... USING graphwright (body)` stores each row's extraction in the **index relation's own pages** (WAL-logged through generic WAL, like pg_search), so it is transactional with the heap and travels with physical replication. `aminsert` writes only a tiny marker on a write; the extractor and judge run asynchronously off the writing transaction, so a slow model never blocks a write. `ambulkdelete` reclaims deleted rows' records on vacuum. The cross-row resolved graph (entities/edges) is derived from index storage into catalog tables, refreshed by `graphwright.maintain()`; the accessors filter it per user against the source table's RLS. Extraction and judging are pluggable seams (`graphwright.extractor`, `graphwright.judge`), defaulting to a built-in tokenizer and no judge. Resolution folds entity surfaces on a normalized key (Arabic/Persian variants meet), and auto-merges distinctive cross-script phonetic and 3-gram fuzzy matches (both gated by entropy). It never waits: every merge is recorded in a durable, reversible decision log a human edits after the fact (SAGA-style, down to splitting a single mention out of an exact fold), and `graphwright.proposals()` shows the matches the gate left for review. The pieces still to come:
 
-- the rest of the cascade (fuzzy/MinHash, embedding) and full NFKC,
+- the rest of the cascade (embedding) and full NFKC,
 - locking the catalog down so the accessors are the only door.
 
 What is already proven is the part nobody else ships: row-derived graph visibility.
@@ -100,7 +100,7 @@ This is the "AI output is never canon" step: the small model proposes mentions, 
 
 A mention's surface resolves to an entity by **exact match on a normalized key** (ported from the graphwright core): Arabic vs Persian yeh/kaf, alef variants, diacritics, tatweel, ZWNJ joins, case, and surrounding punctuation all fold, so `علي` and `علی` are one entity.
 
-Beyond exact, a **cross-script phonetic match auto-merges** when the name is distinctive enough (an entropy gate): `Khashayar` and `خشایار` become one entity, while short names like `Ali` / `علی` stay apart and show up as proposals:
+Beyond exact, two lanes auto-merge when the name is distinctive enough (an entropy gate). A **cross-script phonetic match**: `Khashayar` and `خشایار` become one entity. A **3-gram fuzzy match** (Jaccard >= 0.82): a consonant typo forks the phonetic skeleton but barely moves the shingle overlap, so this catches spellings phonetic misses. Short names like `Ali` / `علی` stay apart and show up as proposals:
 
 ```sql
 SELECT * FROM graphwright.proposals('notes');  -- gated-out candidates to review
@@ -117,7 +117,15 @@ SELECT graphwright.unmerge('notes', 'Ali', 'علی');         -- drop the decisi
 SELECT * FROM graphwright.decisions('notes');              -- the audit log
 ```
 
-Each applies immediately and is reversible: edit or delete the row and the graph re-derives without it. The rest of the cascade (fuzzy/MinHash, embedding) is still to come.
+Every merge is reversible, including an exact fold of two identical spellings (two people both written `Sara`). Find the occurrence and pin it to its own entity:
+
+```sql
+SELECT entity_id, source_pk, surface_form FROM graphwright.mentions('notes');
+SELECT graphwright.split_mention('notes', '(0,2)', 'Sara');    -- separate one occurrence
+SELECT graphwright.unsplit_mention('notes', '(0,2)', 'Sara');  -- fold it back
+```
+
+Each applies immediately and is reversible: edit or delete the underlying row and the graph re-derives without it. The rest of the cascade (embedding, full NFKC) is still to come.
 
 ## Build
 
