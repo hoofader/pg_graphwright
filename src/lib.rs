@@ -42,6 +42,30 @@ fn tokenize(text: &str) -> Vec<String> {
     out
 }
 
+// Extract entity surfaces from a document. The default is the built-in
+// tokenizer (no model). Set graphwright.extractor to a SQL function
+// `f(text) -> text[]` to plug in real extraction: GLiNER via
+// graphwright-onnx, an LLM gateway, a regex NER, anything the host wires
+// up. The extension stays model-agnostic, the way graphwright's core
+// treats the LLM as an injected seam. Called where the row is captured,
+// so the function must be fast; async extraction for slow models is a
+// later step.
+fn extract(text: &str) -> Vec<String> {
+    let Some(name) = EXTRACTOR.get() else {
+        return tokenize(text);
+    };
+    let name = name.to_string_lossy();
+    if name.trim().is_empty() {
+        return tokenize(text);
+    }
+    // name is an admin-set GUC (a function name), interpolated as-is.
+    let arr = pgrx::Spi::get_one::<Vec<Option<String>>>(&format!("SELECT {}({})", name, lit(text)))
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    arr.into_iter().flatten().collect()
+}
+
 enum Visibility {
     Union,
     Intersection,
@@ -186,7 +210,7 @@ fn rebuild(watch_id: i32) -> i64 {
 // Add one row's contribution from its source text (tokenize, then
 // resolve). Used by the no-index reindex path.
 fn index_row(watch_id: i32, source_pk: &str, body: &str) -> i64 {
-    resolve_tokens(watch_id, source_pk, &tokenize(body))
+    resolve_tokens(watch_id, source_pk, &extract(body))
 }
 
 // Resolve a row's already-extracted tokens into entities, mentions, and
@@ -617,7 +641,7 @@ unsafe extern "C-unwind" fn build_callback(
     use pgrx::datum::FromDatum;
     let st = &mut *(state as *mut BuildState);
     let body = String::from_datum(*values, *isnull).unwrap_or_default();
-    let tokens = tokenize(&body);
+    let tokens = extract(&body);
     let block = (((*tid).ip_blkid.bi_hi as u32) << 16) | (*tid).ip_blkid.bi_lo as u32;
     let offset = (*tid).ip_posid;
     storage::append(st.indexrel, &storage::encode(block, offset, &tokens));
@@ -687,7 +711,7 @@ pub unsafe extern "C-unwind" fn aminsert(
 ) -> bool {
     use pgrx::datum::FromDatum;
     let body = String::from_datum(*values, *isnull).unwrap_or_default();
-    let tokens = tokenize(&body);
+    let tokens = extract(&body);
     let block = (((*heap_tid).ip_blkid.bi_hi as u32) << 16) | (*heap_tid).ip_blkid.bi_lo as u32;
     let offset = (*heap_tid).ip_posid;
     storage::append(indexrel, &storage::encode(block, offset, &tokens));
@@ -839,6 +863,7 @@ use std::ffi::CString;
 use std::time::Duration;
 
 static MAINTENANCE_DATABASE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+static EXTRACTOR: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 
 // Bring every graphwright graph current: re-resolve each index from its
 // own storage (the index path), and drain the change queue (the no-index
@@ -912,6 +937,14 @@ pub extern "C-unwind" fn _PG_init() {
         c"Empty disables the worker. Also needs shared_preload_libraries = 'pg_graphwright'.",
         &MAINTENANCE_DATABASE,
         GucContext::Sighup,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"graphwright.extractor",
+        c"SQL function f(text) -> text[] used to extract entity surfaces.",
+        c"Empty uses the built-in tokenizer. Called synchronously, so it must be fast.",
+        &EXTRACTOR,
+        GucContext::Userset,
         GucFlags::default(),
     );
     // Registering a background worker is only valid during preload.
@@ -1445,6 +1478,28 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(surviving.contains("sara") && surviving.contains("tehran"));
+    }
+
+    // A configured extractor replaces the built-in tokenizer. Here a toy
+    // SQL function keeps only capitalized words as entities, so the graph
+    // holds the "entities", not every word.
+    #[pg_test]
+    fn custom_extractor_replaces_tokenization() {
+        Spi::run(
+            "CREATE FUNCTION public.caps(doc text) RETURNS text[] LANGUAGE sql AS $$ \
+             SELECT array_agg(lower(w)) \
+             FROM regexp_split_to_table(doc, '\\s+') AS w \
+             WHERE w ~ '^[A-Z]' $$",
+        )
+        .unwrap();
+        Spi::run("SET graphwright.extractor = 'public.caps'").unwrap();
+
+        Spi::run("CREATE TABLE notes (id int PRIMARY KEY, owner text, body text)").unwrap();
+        Spi::run("INSERT INTO notes VALUES (1, 'amir', 'had coffee with Sara in Tehran')").unwrap();
+        Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+
+        // Only Sara and Tehran survive, not had/coffee/with/in.
+        assert_eq!(all_entities(), vec!["sara", "tehran"]);
     }
 }
 

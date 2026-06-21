@@ -8,9 +8,10 @@ This is the Postgres-native sibling of [graphwright](https://github.com/hoofader
 
 ## Status
 
-Early, but the storage model is now the Postgres-native one. `CREATE INDEX ... USING graphwright (body)` stores each row's extraction in the **index relation's own pages** (WAL-logged through generic WAL, like pg_search), so it is transactional with the heap and travels with physical replication. `aminsert` keeps that storage current on writes, and `ambulkdelete` reclaims deleted rows' records on vacuum. The cross-row resolved graph (entities/edges) is derived from index storage into catalog tables, refreshed by `graphwright.maintain()`; the accessors filter it per user against the source table's RLS. Extraction is still a deterministic stub (tokenize a row, co-mention edges). The pieces still to come:
+Early, but the storage model is now the Postgres-native one. `CREATE INDEX ... USING graphwright (body)` stores each row's extraction in the **index relation's own pages** (WAL-logged through generic WAL, like pg_search), so it is transactional with the heap and travels with physical replication. `aminsert` keeps that storage current on writes, and `ambulkdelete` reclaims deleted rows' records on vacuum. The cross-row resolved graph (entities/edges) is derived from index storage into catalog tables, refreshed by `graphwright.maintain()`; the accessors filter it per user against the source table's RLS. Extraction is a pluggable seam (`graphwright.extractor`), defaulting to a built-in tokenizer. The pieces still to come:
 
-- a real extraction seam (a local LLM / GLiNER via graphwright-onnx, judged by a larger model),
+- async extraction, so a slow `graphwright.extractor` (an LLM / GLiNER) runs off the writing transaction (today the extractor is called synchronously, so it must be fast),
+- a judge seam: a larger model that validates or trims the extractor's output before it reaches the graph,
 - the resolution cascade (phonetic, fuzzy, embedding) ported from the graphwright core,
 - a human-in-the-loop review queue (proposals an operator accepts or rejects),
 - locking the catalog down so the accessors are the only door.
@@ -72,6 +73,20 @@ graphwright.database = 'mydb'
 Splitting the synchronous storage write from the async resolve is deliberate: extraction is a fast stub today, but when it becomes LLM-backed, the per-row tokens are still captured transactionally while the expensive resolution stays off the writing transaction.
 
 There is also a no-index path (`graphwright.watch(table, text_col, pk_col)` + `graphwright.reindex(id)`) that builds the graph straight from source rows, with a trigger-fed queue (`graphwright.process_dirty(id)`) for incremental updates. Use it when you want the graph without `CREATE INDEX`.
+
+## Extraction
+
+What counts as an entity is a pluggable seam, so the extension stays model-agnostic (the way graphwright's core treats the LLM as injected). Point `graphwright.extractor` at a SQL function `f(text) -> text[]`; leave it empty for the built-in tokenizer.
+
+```sql
+-- a toy extractor: capitalized words are entities
+CREATE FUNCTION caps(doc text) RETURNS text[] LANGUAGE sql AS $$
+  SELECT array_agg(w) FROM regexp_split_to_table(doc, '\s+') AS w WHERE w ~ '^[A-Z]'
+$$;
+SET graphwright.extractor = 'caps';
+```
+
+The function can wrap anything: a regex NER, an LLM gateway over `pg_net`, or GLiNER through [graphwright-onnx](https://github.com/hoofader/graphwright-onnx) called from pl/python or an HTTP service. It is called synchronously for now, so it must be fast; running a slow extractor off the writing transaction is the next step.
 
 ## Build
 
