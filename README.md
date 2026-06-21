@@ -8,10 +8,8 @@ This is the Postgres-native sibling of [graphwright](https://github.com/hoofader
 
 ## Status
 
-Early, but the storage model is now the Postgres-native one. `CREATE INDEX ... USING graphwright (body)` stores each row's extraction in the **index relation's own pages** (WAL-logged through generic WAL, like pg_search), so it is transactional with the heap and travels with physical replication. `aminsert` keeps that storage current on writes, and `ambulkdelete` reclaims deleted rows' records on vacuum. The cross-row resolved graph (entities/edges) is derived from index storage into catalog tables, refreshed by `graphwright.maintain()`; the accessors filter it per user against the source table's RLS. Extraction is a pluggable seam (`graphwright.extractor`), defaulting to a built-in tokenizer. The pieces still to come:
+Early, but the storage model is now the Postgres-native one. `CREATE INDEX ... USING graphwright (body)` stores each row's extraction in the **index relation's own pages** (WAL-logged through generic WAL, like pg_search), so it is transactional with the heap and travels with physical replication. `aminsert` writes only a tiny marker on a write; the extractor and judge run asynchronously off the writing transaction, so a slow model never blocks a write. `ambulkdelete` reclaims deleted rows' records on vacuum. The cross-row resolved graph (entities/edges) is derived from index storage into catalog tables, refreshed by `graphwright.maintain()`; the accessors filter it per user against the source table's RLS. Extraction and judging are pluggable seams (`graphwright.extractor`, `graphwright.judge`), defaulting to a built-in tokenizer and no judge. The pieces still to come:
 
-- async extraction, so a slow `graphwright.extractor` (an LLM / GLiNER) runs off the writing transaction (today the extractor is called synchronously, so it must be fast),
-- a judge seam: a larger model that validates or trims the extractor's output before it reaches the graph,
 - the resolution cascade (phonetic, fuzzy, embedding) ported from the graphwright core,
 - a human-in-the-loop review queue (proposals an operator accepts or rejects),
 - locking the catalog down so the accessors are the only door.
@@ -86,7 +84,18 @@ $$;
 SET graphwright.extractor = 'caps';
 ```
 
-The function can wrap anything: a regex NER, an LLM gateway over `pg_net`, or GLiNER through [graphwright-onnx](https://github.com/hoofader/graphwright-onnx) called from pl/python or an HTTP service. It is called synchronously for now, so it must be fast; running a slow extractor off the writing transaction is the next step.
+The function can wrap anything: a regex NER, an LLM gateway over `pg_net`, or GLiNER through [graphwright-onnx](https://github.com/hoofader/graphwright-onnx) called from pl/python or an HTTP service. It runs asynchronously (the maintenance pass), so a slow model is fine; a write only records a marker.
+
+A second seam validates the result. `graphwright.judge` names a function `j(text, text[]) -> text[]` (a larger model) that trims or vets the extractor's mentions before they reach the graph:
+
+```sql
+CREATE FUNCTION vet(doc text, mentions text[]) RETURNS text[] LANGUAGE sql AS $$
+  SELECT array_agg(m) FROM unnest(mentions) AS m WHERE m <> 'secret'
+$$;
+SET graphwright.judge = 'vet';
+```
+
+This is the "AI output is never canon" step: the small model proposes mentions, the larger model disposes. A judge error or NULL leaves the extractor's output unchanged.
 
 ## Build
 

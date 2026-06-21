@@ -42,15 +42,18 @@ fn tokenize(text: &str) -> Vec<String> {
     out
 }
 
-// Extract entity surfaces from a document. The default is the built-in
-// tokenizer (no model). Set graphwright.extractor to a SQL function
-// `f(text) -> text[]` to plug in real extraction: GLiNER via
-// graphwright-onnx, an LLM gateway, a regex NER, anything the host wires
-// up. The extension stays model-agnostic, the way graphwright's core
-// treats the LLM as an injected seam. Called where the row is captured,
-// so the function must be fast; async extraction for slow models is a
-// later step.
+// Extract entity surfaces from a document, then pass them through the
+// judge. Both are pluggable SQL functions, so the extension stays model-
+// agnostic, the way graphwright's core treats the LLM as an injected seam.
+// Runs where extraction is scheduled (async, off the writing transaction).
 fn extract(text: &str) -> Vec<String> {
+    judge(text, run_extractor(text))
+}
+
+// The extractor seam: graphwright.extractor names a function
+// `f(text) -> text[]`. Empty means the built-in tokenizer (no model). The
+// host wires in GLiNER via graphwright-onnx, an LLM gateway, a regex NER.
+fn run_extractor(text: &str) -> Vec<String> {
     let Some(name) = EXTRACTOR.get() else {
         return tokenize(text);
     };
@@ -64,6 +67,45 @@ fn extract(text: &str) -> Vec<String> {
         .flatten()
         .unwrap_or_default();
     arr.into_iter().flatten().collect()
+}
+
+// The judge seam: graphwright.judge names a function
+// `j(text, text[]) -> text[]`, a larger model that validates or trims the
+// extractor's output before it reaches the graph. AI output is never
+// canon; this is where the bigger model disposes. A judge error or NULL
+// keeps the extractor's output unchanged.
+fn judge(text: &str, surfaces: Vec<String>) -> Vec<String> {
+    let Some(name) = JUDGE.get() else {
+        return surfaces;
+    };
+    let name = name.to_string_lossy();
+    if name.trim().is_empty() {
+        return surfaces;
+    }
+    let array = if surfaces.is_empty() {
+        "ARRAY[]::text[]".to_string()
+    } else {
+        format!(
+            "ARRAY[{}]::text[]",
+            surfaces
+                .iter()
+                .map(|s| lit(s))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    match pgrx::Spi::get_one::<Vec<Option<String>>>(&format!(
+        "SELECT {}({}, {})",
+        name,
+        lit(text),
+        array
+    ))
+    .ok()
+    .flatten()
+    {
+        Some(judged) => judged.into_iter().flatten().collect(),
+        None => surfaces,
+    }
 }
 
 enum Visibility {
@@ -150,8 +192,60 @@ fn resolve_from_storage(indexrel: pg_sys::Relation, watch_id: i32) {
     .expect("clear watch");
     let records = unsafe { storage::scan(indexrel) };
     for rec in &records {
-        let (block, offset, tokens) = storage::decode(rec);
-        resolve_tokens(watch_id, &format!("({block},{offset})"), &tokens);
+        let (tag, block, offset, surfaces) = storage::decode(rec);
+        if tag != MENTIONS {
+            continue; // skip markers that are not yet extracted
+        }
+        resolve_tokens(watch_id, &format!("({block},{offset})"), &surfaces);
+    }
+}
+
+// Extract every pending row (markers in index storage), writing the
+// resulting mentions back to storage. This is where the (possibly slow)
+// extractor + judge run, off the writing transaction. Runs privileged so
+// it sees every row.
+fn extract_pending(indexrel: pg_sys::Relation, watch_id: i32) {
+    use pgrx::Spi;
+    let (source_table, text_column) = Spi::get_two::<String, String>(&format!(
+        "SELECT source_table::text, text_column FROM graphwright.watch WHERE id = {watch_id}"
+    ))
+    .expect("watch lookup");
+    let source_table = source_table.expect("source table");
+    let text_column = text_column.expect("text column");
+
+    let markers: Vec<(u32, u16)> = unsafe { storage::scan(indexrel) }
+        .iter()
+        .filter_map(|r| {
+            let (tag, b, o, _) = storage::decode(r);
+            (tag == MARKER).then_some((b, o))
+        })
+        .collect();
+    if markers.is_empty() {
+        return;
+    }
+
+    let mut extracted: Vec<(u32, u16, Vec<String>)> = Vec::new();
+    for (block, offset) in &markers {
+        let text = Spi::get_one::<String>(&format!(
+            "SELECT ({txt})::text FROM {tbl} WHERE ctid = '({block},{offset})'::tid",
+            txt = ident(&text_column),
+            tbl = source_table,
+        ))
+        .ok()
+        .flatten();
+        if let Some(text) = text {
+            extracted.push((*block, *offset, extract(&text)));
+        }
+    }
+
+    // Mark the markers done (only markers exist for these ctids yet), then
+    // append the mentions. Ordering matters: prune before append.
+    let done: std::collections::HashSet<(u32, u16)> = markers.into_iter().collect();
+    unsafe {
+        storage::prune(indexrel, &mut |b, o| done.contains(&(b, o)));
+        for (block, offset, surfaces) in &extracted {
+            storage::append(indexrel, &storage::mentions(*block, *offset, surfaces));
+        }
     }
 }
 
@@ -358,8 +452,16 @@ fn process_dirty(watch_id: i32) -> i64 {
 // A row's extraction (its tokens) is stored in the index relation's own
 // pages, WAL-logged through generic WAL, so it is transactional with the
 // heap and travels with physical replication, like pg_search. The cross-
-// row resolved graph (entities/edges) is derived from this. One record
-// per row: [block u32][offset u16][n u16] then n * ([len u16][utf8]).
+// row resolved graph (entities/edges) is derived from this.
+//
+// Two record kinds, both keyed by heap ctid:
+//   MARKER   [0][block u32][offset u16]                      "needs extraction"
+//   MENTIONS [1][block u32][offset u16][n u16] then n*([len u16][utf8])
+// aminsert writes a marker (fast); the async extract pass turns markers
+// into mentions; resolution reads mentions.
+
+pub const MARKER: u8 = 0;
+pub const MENTIONS: u8 = 1;
 
 mod storage {
     use pgrx::pg_sys;
@@ -367,32 +469,42 @@ mod storage {
     const INVALID_OFFSET: u16 = 0;
     const FIRST_OFFSET: u16 = 1;
 
-    pub fn encode(block: u32, offset: u16, tokens: &[String]) -> Vec<u8> {
-        let mut v = Vec::new();
+    pub fn marker(block: u32, offset: u16) -> Vec<u8> {
+        let mut v = vec![super::MARKER];
         v.extend_from_slice(&block.to_le_bytes());
         v.extend_from_slice(&offset.to_le_bytes());
-        v.extend_from_slice(&(tokens.len() as u16).to_le_bytes());
-        for t in tokens {
-            let b = t.as_bytes();
+        v
+    }
+
+    pub fn mentions(block: u32, offset: u16, surfaces: &[String]) -> Vec<u8> {
+        let mut v = vec![super::MENTIONS];
+        v.extend_from_slice(&block.to_le_bytes());
+        v.extend_from_slice(&offset.to_le_bytes());
+        v.extend_from_slice(&(surfaces.len() as u16).to_le_bytes());
+        for s in surfaces {
+            let b = s.as_bytes();
             v.extend_from_slice(&(b.len() as u16).to_le_bytes());
             v.extend_from_slice(b);
         }
         v
     }
 
-    pub fn decode(data: &[u8]) -> (u32, u16, Vec<String>) {
-        let block = u32::from_le_bytes(data[0..4].try_into().unwrap());
-        let offset = u16::from_le_bytes(data[4..6].try_into().unwrap());
-        let n = u16::from_le_bytes(data[6..8].try_into().unwrap()) as usize;
-        let mut pos = 8;
-        let mut tokens = Vec::with_capacity(n);
-        for _ in 0..n {
-            let len = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
-            pos += 2;
-            tokens.push(String::from_utf8_lossy(&data[pos..pos + len]).into_owned());
-            pos += len;
+    pub fn decode(data: &[u8]) -> (u8, u32, u16, Vec<String>) {
+        let tag = data[0];
+        let block = u32::from_le_bytes(data[1..5].try_into().unwrap());
+        let offset = u16::from_le_bytes(data[5..7].try_into().unwrap());
+        let mut surfaces = Vec::new();
+        if tag == super::MENTIONS {
+            let n = u16::from_le_bytes(data[7..9].try_into().unwrap()) as usize;
+            let mut pos = 9;
+            for _ in 0..n {
+                let len = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+                pos += 2;
+                surfaces.push(String::from_utf8_lossy(&data[pos..pos + len]).into_owned());
+                pos += len;
+            }
         }
-        (block, offset, tokens)
+        (tag, block, offset, surfaces)
     }
 
     // Index pages are always shared buffers, so the page pointer is a
@@ -512,7 +624,7 @@ mod storage {
                     if (*iid).lp_flags() == pg_sys::LP_NORMAL {
                         let item = pg_sys::PageGetItem(pg, iid) as *const u8;
                         let len = (*iid).lp_len() as usize;
-                        let (block, offset, _) = decode(std::slice::from_raw_parts(item, len));
+                        let (_, block, offset, _) = decode(std::slice::from_raw_parts(item, len));
                         if is_dead(block, offset) {
                             (*iid).set_lp_flags(pg_sys::LP_DEAD);
                             (*iid).set_lp_off(0);
@@ -558,7 +670,7 @@ fn gc(index: &str) -> i64 {
         pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
         recs.iter()
             .map(|r| {
-                let (b, o, _) = storage::decode(r);
+                let (_, b, o, _) = storage::decode(r);
                 (b, o)
             })
             .collect()
@@ -600,10 +712,13 @@ fn index_dump(index: &str) -> Vec<(String, Vec<Option<String>>)> {
     unsafe {
         let rel = pg_sys::relation_open(oid, pg_sys::AccessShareLock as i32);
         for rec in storage::scan(rel) {
-            let (block, offset, tokens) = storage::decode(&rec);
+            let (tag, block, offset, surfaces) = storage::decode(&rec);
+            if tag != MENTIONS {
+                continue;
+            }
             out.push((
                 format!("({block},{offset})"),
-                tokens.into_iter().map(Some).collect(),
+                surfaces.into_iter().map(Some).collect(),
             ));
         }
         pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
@@ -627,24 +742,21 @@ struct BuildState {
     ntuples: f64,
 }
 
-// Per-row build callback: tokenize the indexed column and store the
-// tokens in the index relation's pages, keyed by heap ctid.
+// Per-row build callback: write a marker for each row into index storage.
+// ambuild then runs extract_pending to turn the markers into mentions.
 #[pg_guard]
 unsafe extern "C-unwind" fn build_callback(
     _index: pg_sys::Relation,
     tid: pg_sys::ItemPointer,
-    values: *mut pg_sys::Datum,
-    isnull: *mut bool,
+    _values: *mut pg_sys::Datum,
+    _isnull: *mut bool,
     _tuple_is_alive: bool,
     state: *mut c_void,
 ) {
-    use pgrx::datum::FromDatum;
     let st = &mut *(state as *mut BuildState);
-    let body = String::from_datum(*values, *isnull).unwrap_or_default();
-    let tokens = extract(&body);
     let block = (((*tid).ip_blkid.bi_hi as u32) << 16) | (*tid).ip_blkid.bi_lo as u32;
     let offset = (*tid).ip_posid;
-    storage::append(st.indexrel, &storage::encode(block, offset, &tokens));
+    storage::append(st.indexrel, &storage::marker(block, offset));
     st.ntuples += 1.0;
 }
 
@@ -669,8 +781,8 @@ pub unsafe extern "C-unwind" fn ambuild(
             .expect("table name");
     let watch_id = upsert_watch(&table, &column, "ctid");
 
-    // Store each row's tokens in the index's own storage, then resolve the
-    // graph from that storage (not from the source rows).
+    // Mark every row in storage, extract them (inline here; a build is a
+    // one-time DDL), then resolve the graph from the resulting mentions.
     let mut st = BuildState {
         indexrel,
         ntuples: 0.0,
@@ -685,6 +797,7 @@ pub unsafe extern "C-unwind" fn ambuild(
         &mut st as *mut _ as *mut c_void,
         std::ptr::null_mut(),
     );
+    extract_pending(indexrel, watch_id);
     resolve_from_storage(indexrel, watch_id);
 
     let mut result = pgrx::PgBox::<pg_sys::IndexBuildResult>::alloc0();
@@ -696,25 +809,25 @@ pub unsafe extern "C-unwind" fn ambuild(
 #[pg_guard]
 pub unsafe extern "C-unwind" fn ambuildempty(_indexrel: pg_sys::Relation) {}
 
-// Store the new row's tokens in index storage (WAL-logged, in the writing
-// transaction). The resolved graph catches up on the next maintain().
+// Mark the new row for extraction (a tiny WAL-logged write in the writing
+// transaction). The extractor and the resolved graph catch up on the next
+// maintain(), so a slow model never blocks the write.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn aminsert(
     indexrel: pg_sys::Relation,
-    values: *mut pg_sys::Datum,
-    isnull: *mut bool,
+    _values: *mut pg_sys::Datum,
+    _isnull: *mut bool,
     heap_tid: pg_sys::ItemPointer,
     _heaprel: pg_sys::Relation,
     _check_unique: pg_sys::IndexUniqueCheck::Type,
     _index_unchanged: bool,
     _index_info: *mut pg_sys::IndexInfo,
 ) -> bool {
-    use pgrx::datum::FromDatum;
-    let body = String::from_datum(*values, *isnull).unwrap_or_default();
-    let tokens = extract(&body);
+    // Just a marker; the (possibly slow) extraction runs later, off the
+    // writing transaction.
     let block = (((*heap_tid).ip_blkid.bi_hi as u32) << 16) | (*heap_tid).ip_blkid.bi_lo as u32;
     let offset = (*heap_tid).ip_posid;
-    storage::append(indexrel, &storage::encode(block, offset, &tokens));
+    storage::append(indexrel, &storage::marker(block, offset));
     false
 }
 
@@ -864,6 +977,7 @@ use std::time::Duration;
 
 static MAINTENANCE_DATABASE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 static EXTRACTOR: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+static JUDGE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 
 // Bring every graphwright graph current: re-resolve each index from its
 // own storage (the index path), and drain the change queue (the no-index
@@ -907,9 +1021,10 @@ fn drain_all() -> i64 {
         .flatten();
         if let Some(wid) = watch_id {
             unsafe {
-                let rel = pg_sys::relation_open(indexrelid, pg_sys::AccessShareLock as i32);
+                let rel = pg_sys::relation_open(indexrelid, pg_sys::RowExclusiveLock as i32);
+                extract_pending(rel, wid);
                 resolve_from_storage(rel, wid);
-                pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+                pg_sys::relation_close(rel, pg_sys::RowExclusiveLock as i32);
             }
             touched += 1;
         }
@@ -942,8 +1057,16 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_string_guc(
         c"graphwright.extractor",
         c"SQL function f(text) -> text[] used to extract entity surfaces.",
-        c"Empty uses the built-in tokenizer. Called synchronously, so it must be fast.",
+        c"Empty uses the built-in tokenizer. Called asynchronously by the maintenance pass.",
         &EXTRACTOR,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"graphwright.judge",
+        c"SQL function j(text, text[]) -> text[] that validates the extractor output.",
+        c"Empty applies no judge. A larger model can drop or keep mentions here.",
+        &JUDGE,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -1379,8 +1502,10 @@ mod tests {
         Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
         assert_eq!(all_entities(), vec!["sara", "tehran"]);
 
-        // INSERT: aminsert stores it, maintain() resolves it in.
+        // INSERT marks the row; extraction is async, so it is not in the
+        // graph until maintain() runs.
         Spi::run("INSERT INTO notes VALUES (2, 'amir', 'Reza Berlin')").unwrap();
+        assert_eq!(all_entities(), vec!["sara", "tehran"]);
         Spi::run("SELECT graphwright.maintain()").unwrap();
         assert_eq!(all_entities(), vec!["berlin", "reza", "sara", "tehran"]);
 
@@ -1499,6 +1624,32 @@ mod tests {
         Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
 
         // Only Sara and Tehran survive, not had/coffee/with/in.
+        assert_eq!(all_entities(), vec!["sara", "tehran"]);
+    }
+
+    // The judge runs after the extractor and can drop mentions before they
+    // reach the graph (here a larger model would decide; the toy judge just
+    // removes a word).
+    #[pg_test]
+    fn judge_trims_extractor_output() {
+        Spi::run(
+            "CREATE FUNCTION public.words(doc text) RETURNS text[] LANGUAGE sql AS $$ \
+             SELECT array_agg(lower(w)) FROM regexp_split_to_table(doc, '\\s+') AS w $$",
+        )
+        .unwrap();
+        Spi::run(
+            "CREATE FUNCTION public.drop_secret(doc text, ms text[]) RETURNS text[] \
+             LANGUAGE sql AS $$ SELECT array_agg(m) FROM unnest(ms) AS m WHERE m <> 'secret' $$",
+        )
+        .unwrap();
+        Spi::run("SET graphwright.extractor = 'public.words'").unwrap();
+        Spi::run("SET graphwright.judge = 'public.drop_secret'").unwrap();
+
+        Spi::run("CREATE TABLE notes (id int PRIMARY KEY, owner text, body text)").unwrap();
+        Spi::run("INSERT INTO notes VALUES (1, 'amir', 'sara secret tehran')").unwrap();
+        Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+
+        // The extractor yields sara/secret/tehran; the judge drops 'secret'.
         assert_eq!(all_entities(), vec!["sara", "tehran"]);
     }
 }
