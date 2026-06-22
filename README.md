@@ -8,10 +8,10 @@ This is the Postgres-native sibling of [graphwright](https://github.com/hoofader
 
 ## Status
 
-Early, but the storage model is now the Postgres-native one. `CREATE INDEX ... USING graphwright (body)` stores each row's extraction in the **index relation's own pages** (WAL-logged through generic WAL, like pg_search), so it is transactional with the heap and travels with physical replication. `aminsert` writes only a tiny marker on a write; the extractor and judge run asynchronously off the writing transaction, so a slow model never blocks a write. `ambulkdelete` reclaims deleted rows' records on vacuum. The cross-row resolved graph (entities/edges) is derived from index storage into catalog tables, refreshed by `graphwright.maintain()`; the accessors filter it per user against the source table's RLS. Extraction and judging are pluggable seams (`graphwright.extractor`, `graphwright.judge`), defaulting to a built-in tokenizer and no judge. Resolution folds entity surfaces on a normalized key (Arabic/Persian variants meet), and auto-merges distinctive cross-script phonetic and 3-gram fuzzy matches (both gated by entropy). It never waits: every merge is recorded in a durable, reversible decision log a human edits after the fact (SAGA-style, down to splitting a single mention out of an exact fold), and `graphwright.proposals()` shows the matches the gate left for review. The pieces still to come:
+Early, but the storage model is now the Postgres-native one. `CREATE INDEX ... USING graphwright (body)` stores each row's extraction in the **index relation's own pages** (WAL-logged through generic WAL, like pg_search), so it is transactional with the heap and travels with physical replication. `aminsert` writes only a tiny marker on a write, and `CREATE INDEX` itself only marks rows; the extractor, judge, and resolved graph build on the next `graphwright.maintain()` (or background-worker) tick, which runs as the extension owner so it sees every row. A slow model never blocks a write. `ambulkdelete` reclaims deleted rows' records on vacuum. The cross-row resolved graph (entities/edges) is derived from index storage into catalog tables that carry **row-level security** so a graph row is visible exactly when the source row(s) behind it are; the accessors and a direct catalog read are filtered the same way. Extraction and judging are pluggable seams (`graphwright.extractor`, `graphwright.judge`), defaulting to a built-in tokenizer and no judge. Resolution folds entity surfaces on a normalized key (Arabic/Persian variants meet), and auto-merges distinctive cross-script phonetic and 3-gram fuzzy matches (both gated by entropy). It never waits: every merge is recorded in a durable, reversible decision log a human edits after the fact (SAGA-style, down to splitting a single mention out of an exact fold), and `graphwright.proposals()` shows the matches the gate left for review. The pieces still to come:
 
-- the rest of the cascade (embedding) and full NFKC,
-- locking the catalog down so the accessors are the only door.
+- full NFKC in the resolver (the last cascade stage),
+- RLS on `edge_support` (today it is unprotected; it holds only opaque `edge_id`/`source_pk`, no names).
 
 What is already proven is the part nobody else ships: row-derived graph visibility.
 
@@ -50,6 +50,17 @@ An edge can be supported by more than one source row. Two rules, set per watch (
 UPDATE graphwright.watch SET visibility = 'intersection'
   WHERE source_table = 'notes'::regclass;
 ```
+
+## How the visibility is enforced
+
+The catalog tables carry their own row-level security. A `SECURITY INVOKER` function `graphwright._pk_visible(watch_id, source_pk)` runs an `EXISTS` against the source table, so the source's RLS decides as the calling user; the `entity`/`mention`/`edge`/`entity_phonetic`/`decision`/`mention_override` policies build on it. So a direct `SELECT * FROM graphwright.entity` is filtered the same as the accessor, and the accessor is no privileged back door:
+
+```sql
+SET ROLE analyst_without_access;
+SELECT count(*) FROM graphwright.entity;   -- only entities from rows analyst can read
+```
+
+Maintenance runs as the extension owner (which bypasses RLS, so the graph is built over every row) and the maintenance and review functions (`maintain`, `reindex`, `gc`, `merge`/`split`/`unmerge`, `split_mention`/`unsplit_mention`, `index_dump`) have `EXECUTE` revoked from `PUBLIC`. Grant those to your operator and reviewer roles. The owner must be able to read every source row (a superuser, a `BYPASSRLS` role, or the table owner) for extraction to be complete.
 
 ## Live maintenance
 
