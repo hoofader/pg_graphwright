@@ -8,10 +8,7 @@ This is the Postgres-native sibling of [graphwright](https://github.com/hoofader
 
 ## Status
 
-Early, but the storage model is now the Postgres-native one. `CREATE INDEX ... USING graphwright (body)` stores each row's extraction in the **index relation's own pages** (WAL-logged through generic WAL, like pg_search), so it is transactional with the heap and travels with physical replication. `aminsert` writes only a tiny marker on a write, and `CREATE INDEX` itself only marks rows; the extractor, judge, and resolved graph build on the next `graphwright.maintain()` (or background-worker) tick, which runs as the extension owner so it sees every row. A slow model never blocks a write. `ambulkdelete` reclaims deleted rows' records on vacuum. The cross-row resolved graph (entities/edges) is derived from index storage into catalog tables that carry **row-level security** so a graph row is visible exactly when the source row(s) behind it are; the accessors and a direct catalog read are filtered the same way. Extraction and judging are pluggable seams (`graphwright.extractor`, `graphwright.judge`), defaulting to a built-in tokenizer and no judge. Resolution folds entity surfaces on a normalized key (Arabic/Persian variants meet), and auto-merges distinctive cross-script phonetic and 3-gram fuzzy matches (both gated by entropy). It never waits: every merge is recorded in a durable, reversible decision log a human edits after the fact (SAGA-style, down to splitting a single mention out of an exact fold), and `graphwright.proposals()` shows the matches the gate left for review. The pieces still to come:
-
-- full NFKC in the resolver (the last cascade stage),
-- RLS on `edge_support` (today it is unprotected; it holds only opaque `edge_id`/`source_pk`, no names).
+Early, but the storage model is now the Postgres-native one. `CREATE INDEX ... USING graphwright (body)` stores each row's extraction in the **index relation's own pages** (WAL-logged through generic WAL, like pg_search), so it is transactional with the heap and travels with physical replication. `aminsert` writes only a tiny marker on a write, and `CREATE INDEX` itself only marks rows; the extractor, judge, and resolved graph build on the next `graphwright.maintain()` (or background-worker) tick, which runs as the extension owner so it sees every row. A slow model never blocks a write. `ambulkdelete` reclaims deleted rows' records on vacuum. The cross-row resolved graph (entities/edges) is derived from index storage into catalog tables that carry **row-level security** so a graph row is visible exactly when the source row(s) behind it are; the accessors and a direct catalog read are filtered the same way. Extraction and judging are pluggable seams (`graphwright.extractor`, `graphwright.judge`), defaulting to a built-in tokenizer and no judge. Resolution folds entity surfaces on a normalized key (Arabic/Persian variants meet), and auto-merges distinctive cross-script phonetic and 3-gram fuzzy matches (both gated by entropy). It never waits: every merge is recorded in a durable, reversible decision log a human edits after the fact (SAGA-style, down to splitting a single mention out of an exact fold), and `graphwright.proposals()` shows the matches the gate left for review. Resolution normalizes through NFKC (so compatibility forms, presentation forms, and ligatures fold), the Arabic/Persian script folds, and diacritic stripping. Every content table is under row-level security. The pieces still to come are an LLM eval lane and more phonetic schemes; the core is in place.
 
 What is already proven is the part nobody else ships: row-derived graph visibility.
 
@@ -109,13 +106,15 @@ This is the "AI output is never canon" step: the small model proposes mentions, 
 
 ## Resolution
 
-A mention's surface resolves to an entity by **exact match on a normalized key** (ported from the graphwright core): Arabic vs Persian yeh/kaf, alef variants, diacritics, tatweel, ZWNJ joins, case, and surrounding punctuation all fold, so `علي` and `علی` are one entity.
+A mention's surface resolves to an entity by **exact match on a normalized key** (ported from the graphwright core): NFKC, then Arabic vs Persian yeh/kaf, alef variants, diacritics, tatweel, ZWNJ joins, case, and surrounding punctuation all fold, so `علي` and `علی` are one entity, and `Ｒｅｚａ` is `reza`.
 
 Beyond exact, two lanes auto-merge when the name is distinctive enough (an entropy gate). A **cross-script phonetic match**: `Khashayar` and `خشایار` become one entity. A **3-gram fuzzy match** (Jaccard >= 0.82): a consonant typo forks the phonetic skeleton but barely moves the shingle overlap, so this catches spellings phonetic misses. Short names like `Ali` / `علی` stay apart and show up as proposals:
 
 ```sql
 SELECT * FROM graphwright.proposals('notes');  -- gated-out candidates to review
 ```
+
+When `graphwright.embedder` (a `f(text) -> float8[]` seam) is set, an **embedding match** auto-merges names whose vectors clear `graphwright.embedding_threshold` (default `0.83`). This is the semantic lane: it reaches short names the entropy gate keeps out of the lexical lanes, so `Ali` / `علی` can merge on meaning.
 
 ### Reviewing decisions
 
@@ -136,7 +135,7 @@ SELECT graphwright.split_mention('notes', '(0,2)', 'Sara');    -- separate one o
 SELECT graphwright.unsplit_mention('notes', '(0,2)', 'Sara');  -- fold it back
 ```
 
-Each applies immediately and is reversible: edit or delete the underlying row and the graph re-derives without it. The rest of the cascade (embedding, full NFKC) is still to come.
+Each applies immediately and is reversible: edit or delete the underlying row and the graph re-derives without it.
 
 ## Build
 
