@@ -608,8 +608,8 @@ fn resolve_tokens(
         .expect("edge upsert")
         .expect("edge id");
         Spi::run(&format!(
-            "INSERT INTO graphwright.edge_support (edge_id, source_pk) VALUES ({edge_id}, {pk}) \
-             ON CONFLICT DO NOTHING",
+            "INSERT INTO graphwright.edge_support (edge_id, watch_id, source_pk) \
+             VALUES ({edge_id}, {watch_id}, {pk}) ON CONFLICT DO NOTHING",
             pk = lit(source_pk),
         ))
         .expect("edge support");
@@ -1468,6 +1468,10 @@ CREATE TABLE graphwright.edge (
 
 CREATE TABLE graphwright.edge_support (
     edge_id   bigint NOT NULL REFERENCES graphwright.edge(id) ON DELETE CASCADE,
+    -- Denormalized from the edge so the row-level-security policy is self
+    -- contained: a policy that read graphwright.edge would recurse, since
+    -- edge's own policy reads edge_support.
+    watch_id  integer NOT NULL REFERENCES graphwright.watch(id) ON DELETE CASCADE,
     source_pk text NOT NULL,
     PRIMARY KEY (edge_id, source_pk)
 );
@@ -1533,6 +1537,15 @@ BEGIN
 END;
 $pkv$;
 
+-- Every source_pk supporting an edge, read as the owner so it bypasses
+-- edge_support's own row security. The edge policy applies _pk_visible to
+-- these itself; reading edge_support directly would instead be filtered to
+-- the visible supports and lose the ones intersection needs to count.
+CREATE FUNCTION graphwright._edge_supports(eid bigint) RETURNS SETOF text
+    LANGUAGE sql STABLE SECURITY DEFINER AS $es$
+    SELECT source_pk FROM graphwright.edge_support WHERE edge_id = eid
+$es$;
+
 -- The lockdown: row-level security ON the catalog content tables, so a
 -- graph row is visible exactly when the source row(s) behind it are. The
 -- accessors are SECURITY INVOKER and these policies filter them; a direct
@@ -1577,8 +1590,9 @@ CREATE POLICY decision_visible ON graphwright.decision
           AND graphwright._pk_visible(mn.watch_id, mn.source_pk)));
 
 -- Edge visibility follows the watch's rule over its supporting rows:
--- union (any visible) or intersection (all visible). edge_support has no
--- policy, so the subquery sees every support and _pk_visible decides.
+-- union (any visible) or intersection (all visible). It reads the supports
+-- through _edge_supports (owner-side) so it always sees every support, then
+-- applies _pk_visible as the caller.
 ALTER TABLE graphwright.edge ENABLE ROW LEVEL SECURITY;
 CREATE POLICY edge_visible ON graphwright.edge
     USING (
@@ -1586,15 +1600,20 @@ CREATE POLICY edge_visible ON graphwright.edge
                  (SELECT visibility FROM graphwright.watch WHERE id = watch_id), 'union'
              ) = 'intersection'
         THEN NOT EXISTS (
-            SELECT 1 FROM graphwright.edge_support sup
-            WHERE sup.edge_id = edge.id
-              AND NOT graphwright._pk_visible(edge.watch_id, sup.source_pk))
+            SELECT 1 FROM graphwright._edge_supports(edge.id) AS sp
+            WHERE NOT graphwright._pk_visible(edge.watch_id, sp))
         ELSE EXISTS (
-            SELECT 1 FROM graphwright.edge_support sup
-            WHERE sup.edge_id = edge.id
-              AND graphwright._pk_visible(edge.watch_id, sup.source_pk))
+            SELECT 1 FROM graphwright._edge_supports(edge.id) AS sp
+            WHERE graphwright._pk_visible(edge.watch_id, sp))
         END
     );
+
+-- A support row is visible when its own source row is. It uses its own
+-- watch_id (not a join to edge) so this policy and edge's policy do not
+-- reference each other and recurse.
+ALTER TABLE graphwright.edge_support ENABLE ROW LEVEL SECURITY;
+CREATE POLICY edge_support_visible ON graphwright.edge_support
+    USING (graphwright._pk_visible(watch_id, source_pk));
 "#,
         name = "catalog",
     );
@@ -2044,13 +2063,19 @@ mod tests {
         assert_eq!(total, 4);
         // role_b reads only row 2 (sara, berlin). The accessor shows that...
         assert_eq!(entities_as("role_b"), vec!["berlin", "sara"]);
-        // ...and so does a direct SELECT on the catalog table: no back door.
+        // ...and so does a direct SELECT on the catalog tables: no back door.
+        // Each row contributes one edge_support row (4 total); role_b sees
+        // only the one backed by its row.
         Spi::run("SET ROLE role_b").unwrap();
-        let direct = Spi::get_one::<i64>("SELECT count(*) FROM graphwright.entity")
+        let entity_direct = Spi::get_one::<i64>("SELECT count(*) FROM graphwright.entity")
+            .unwrap()
+            .unwrap();
+        let support_direct = Spi::get_one::<i64>("SELECT count(*) FROM graphwright.edge_support")
             .unwrap()
             .unwrap();
         Spi::run("RESET ROLE").unwrap();
-        assert_eq!(direct, 2);
+        assert_eq!(entity_direct, 2);
+        assert_eq!(support_direct, 1);
     }
 
     // CREATE INDEX ... USING graphwright drives the same extraction with
