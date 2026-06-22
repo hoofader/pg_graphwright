@@ -215,8 +215,68 @@ fn persian_word_keys(word: &str) -> Vec<String> {
     expand_classes(&class_seq)
 }
 
+// Cyrillic scheme: Russian-leaning (г is g). Vowels and the soft/hard signs
+// drop; the й glide and word-initial iotated vowels fork. So "хабаров" and
+// "khabarov" both reduce to "xbrv".
+fn cyrillic_matches(word: &str) -> bool {
+    word.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c))
+}
+
+fn cyrillic_class(ch: char) -> Option<Vec<&'static str>> {
+    let c: &[&str] = match ch {
+        'б' => &["b"],
+        'в' => &["v"],
+        'г' => &["g"],
+        'д' => &["d"],
+        'ж' => &["j"],
+        'з' => &["z"],
+        'к' => &["k"],
+        'л' => &["l"],
+        'м' => &["m"],
+        'н' => &["n"],
+        'п' => &["p"],
+        'р' => &["r"],
+        'с' => &["s"],
+        'т' => &["t"],
+        'ф' => &["f"],
+        'х' => &["x"],
+        'ц' => &["ts"],
+        'ч' | 'ш' | 'щ' => &["c"],
+        // Ambiguous glide.
+        'й' => &["y", ""],
+        // Vowels and the soft/hard signs contribute nothing.
+        'а' | 'о' | 'у' | 'ы' | 'э' | 'и' | 'е' | 'ё' | 'я' | 'ю' | 'і' | 'ї' | 'є' | 'ь'
+        | 'ъ' => &[""],
+        _ => return None,
+    };
+    Some(c.to_vec())
+}
+
+fn cyrillic_word_keys(word: &str) -> Vec<String> {
+    let chars: Vec<char> = word.chars().collect();
+    let mut class_seq: Vec<Vec<&str>> = Vec::new();
+    for (i, &ch) in chars.iter().enumerate() {
+        // Word-initial iotated vowels begin with a y-glide.
+        if i == 0 && matches!(ch, 'я' | 'ю' | 'ё' | 'е' | 'є' | 'ї') {
+            class_seq.push(vec!["y", ""]);
+            continue;
+        }
+        let classes = match cyrillic_class(ch) {
+            Some(c) => c,
+            None => continue,
+        };
+        // Word-initial й is reliably a consonant.
+        if i == 0 && ch == 'й' {
+            class_seq.push(vec!["y"]);
+            continue;
+        }
+        class_seq.push(classes);
+    }
+    expand_classes(&class_seq)
+}
+
 /// Phonetic keys for a name (any script, possibly multi-word). Per-word
-/// skeletons joined by a space; the Persian scheme is consulted before
+/// skeletons joined by a space; Persian then Cyrillic are consulted before
 /// Latin. An empty result means no scheme claimed any word.
 pub fn phonetic_keys(name: &str) -> Vec<String> {
     let lower = name.to_lowercase();
@@ -230,6 +290,8 @@ pub fn phonetic_keys(name: &str) -> Vec<String> {
         .map(|w| {
             if persian_matches(w) {
                 persian_word_keys(w)
+            } else if cyrillic_matches(w) {
+                cyrillic_word_keys(w)
             } else if latin_matches(w) {
                 latin_word_keys(w)
             } else {
@@ -481,6 +543,21 @@ mod tests {
 
     fn set(xs: &[&str]) -> HashSet<String> {
         xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn cyrillic_bridges_to_latin() {
+        // Хабаров and Khabarov both reduce to "xbrv".
+        let ru = phonetic_keys("Хабаров");
+        let en = phonetic_keys("Khabarov");
+        assert!(ru.iter().any(|k| en.contains(k)), "ru={ru:?} en={en:?}");
+        // Сергей shares "srg" with Sergei.
+        let s_ru = phonetic_keys("Сергей");
+        let s_en = phonetic_keys("Sergei");
+        assert!(s_ru.iter().any(|k| s_en.contains(k)), "{s_ru:?} {s_en:?}");
+        // Unrelated names do not bridge.
+        let ivan = phonetic_keys("Иванов");
+        assert!(!ivan.iter().any(|k| en.contains(k)));
     }
 
     #[test]
