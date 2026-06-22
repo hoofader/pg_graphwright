@@ -91,7 +91,7 @@ $$;
 SET graphwright.extractor = 'caps';
 ```
 
-The function can wrap anything: a regex NER, an LLM gateway over `pg_net`, or GLiNER through [graphwright-onnx](https://github.com/hoofader/graphwright-onnx) called from pl/python or an HTTP service. It runs asynchronously (the maintenance pass), so a slow model is fine; a write only records a marker.
+The function can wrap anything: a regex NER, an LLM gateway over `pg_net`, or GLiNER through [graphwright-onnx](https://github.com/hoofader/graphwright-onnx). For GLiNER, run its HTTP service and point the seam at it with [`examples/gliner-extractor.sql`](examples/gliner-extractor.sql) (a `pgsql-http` function that POSTs the document and returns the surfaces). It runs asynchronously (the maintenance pass), so a slow model is fine; a write only records a marker.
 
 A second seam validates the result. `graphwright.judge` names a function `j(text, text[]) -> text[]` (a larger model) that trims or vets the extractor's mentions before they reach the graph:
 
