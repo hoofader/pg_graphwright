@@ -140,11 +140,12 @@ Each applies immediately and is reversible: edit or delete the underlying row an
 ## Build
 
 ```bash
-cargo pgrx run pg17      # build, install, open a psql
-cargo pgrx test pg17     # run the regression tests
+cargo pgrx run pg17           # build, install, open a psql
+cargo pgrx test pg17          # run the regression tests
+./scripts/smoke-bgworker.sh   # end-to-end check of the background worker
 ```
 
-Requires the pgrx toolchain (`cargo install cargo-pgrx`, then `cargo pgrx init`). Built against `pgrx 0.18`.
+Requires the pgrx toolchain (`cargo install cargo-pgrx`, then `cargo pgrx init`). Built against `pgrx 0.18`. The background worker needs `shared_preload_libraries` and a restart, so it cannot run in `cargo pgrx test`; `scripts/smoke-bgworker.sh` exercises it against a throwaway cluster instead.
 
 ## License
 
