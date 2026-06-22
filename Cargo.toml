@@ -23,6 +23,7 @@ pg_bench = ["dep:pgrx-bench"]
 
 [dependencies]
 pgrx = "=0.18.0"
+unicode-normalization = "0.1"
 
 [dependencies.pgrx-bench]
 version = "=0.18.0"

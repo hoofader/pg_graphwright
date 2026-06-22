@@ -3,9 +3,8 @@
 // Pure, deterministic: the lexical stages of the resolution cascade. Used
 // to fold entity surfaces (exact, on the normalized key) and to propose
 // cross-script matches (phonetic keys).
-//
-// NFKC is not applied yet (the TS core runs it first); the explicit
-// Arabic->Persian folds plus diacritic removal cover typed-name variants.
+
+use unicode_normalization::UnicodeNormalization;
 
 fn fold_char(c: char) -> char {
     match c {
@@ -28,12 +27,13 @@ fn is_removable(c: char) -> bool {
         || u == 0x200D
 }
 
-/// Aggressively normalize a name for matching (never for display). Folds
-/// Arabic/Persian codepoint variants, strips diacritics/tatweel/ZWNJ,
-/// lowercases, and trims surrounding punctuation, collapsing whitespace.
+/// Aggressively normalize a name for matching (never for display). Applies
+/// NFKC first (so compatibility forms, presentation forms, and ligatures
+/// reach one shape), then folds Arabic/Persian codepoint variants, strips
+/// diacritics/tatweel/ZWNJ, lowercases, and trims surrounding punctuation.
 pub fn normalize_name(raw: &str) -> String {
     let folded: String = raw
-        .chars()
+        .nfkc()
         .map(fold_char)
         .filter(|c| !is_removable(*c))
         .collect();
@@ -481,6 +481,15 @@ mod tests {
 
     fn set(xs: &[&str]) -> HashSet<String> {
         xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn nfkc_folds_compatibility_forms() {
+        // Full-width Latin and the ﬁ ligature reach the same plain key.
+        assert_eq!(normalize_name("Ｒｅｚａ"), "reza");
+        assert_eq!(normalize_name("ﬁrouz"), "firouz");
+        // Already-normal names are unchanged by NFKC.
+        assert_eq!(normalize_name("Reza"), "reza");
     }
 
     #[test]
