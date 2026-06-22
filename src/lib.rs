@@ -1044,10 +1044,12 @@ pub unsafe extern "C-unwind" fn ambuild(
         pgrx::Spi::get_one::<String>(&format!("SELECT {}::regclass::text", heap_oid.to_u32()))
             .expect("table name")
             .expect("table name");
-    let watch_id = upsert_watch(&table, &column, "ctid");
+    let _watch_id = upsert_watch(&table, &column, "ctid");
 
-    // Mark every row in storage, extract them (inline here; a build is a
-    // one-time DDL), then resolve the graph from the resulting mentions.
+    // Mark every row in storage. Extraction and the resolved graph build on
+    // the next maintain()/worker tick, which runs as the extension owner so
+    // it sees every row (not just the index creator's RLS-visible ones) and
+    // its writes bypass the catalog row-level security.
     let mut st = BuildState {
         indexrel,
         ntuples: 0.0,
@@ -1062,8 +1064,6 @@ pub unsafe extern "C-unwind" fn ambuild(
         &mut st as *mut _ as *mut c_void,
         std::ptr::null_mut(),
     );
-    extract_pending(indexrel, watch_id);
-    resolve_from_storage(indexrel, watch_id);
 
     let mut result = pgrx::PgBox::<pg_sys::IndexBuildResult>::alloc0();
     result.heap_tuples = st.ntuples;
@@ -1509,14 +1509,118 @@ BEGIN
 END;
 $enqueue$;
 
--- M1a exposes the graph only through the RLS-aware accessors, but those
--- run as the caller (SECURITY INVOKER), so the caller needs read access
--- to the catalog. Locking the catalog down (so the accessors are the
--- only door) is a later hardening step.
 GRANT USAGE ON SCHEMA graphwright TO PUBLIC;
 GRANT SELECT ON ALL TABLES IN SCHEMA graphwright TO PUBLIC;
+
+-- Is source row `pk` visible to the current caller? SECURITY INVOKER, so
+-- the probe runs the source table's row-level security as the caller. This
+-- is the bridge that carries the source's RLS onto the derived graph.
+CREATE FUNCTION graphwright._pk_visible(wid integer, pk text) RETURNS boolean
+    LANGUAGE plpgsql STABLE SECURITY INVOKER AS $pkv$
+DECLARE
+    tbl text;
+    col text;
+    ok  boolean;
+BEGIN
+    SELECT source_table::text, pk_column INTO tbl, col
+    FROM graphwright.watch WHERE id = wid;
+    IF tbl IS NULL THEN
+        RETURN false;
+    END IF;
+    EXECUTE format('SELECT EXISTS (SELECT 1 FROM %s s WHERE (s.%I)::text = $1)', tbl, col)
+        INTO ok USING pk;
+    RETURN ok;
+END;
+$pkv$;
+
+-- The lockdown: row-level security ON the catalog content tables, so a
+-- graph row is visible exactly when the source row(s) behind it are. The
+-- accessors are SECURITY INVOKER and these policies filter them; a direct
+-- SELECT on the catalog is filtered the same way, so the accessors are no
+-- privileged back door. Maintenance runs as the owner, which bypasses RLS
+-- (it is enabled, not forced), so the graph is still built over every row.
+-- Each policy decides visibility through _pk_visible directly. A policy
+-- cannot lean on another catalog table's RLS: Postgres does not re-apply
+-- row security to tables read inside a policy expression, so the visibility
+-- test must be self-contained here.
+ALTER TABLE graphwright.mention ENABLE ROW LEVEL SECURITY;
+CREATE POLICY mention_visible ON graphwright.mention
+    USING (graphwright._pk_visible(watch_id, source_pk));
+
+ALTER TABLE graphwright.entity ENABLE ROW LEVEL SECURITY;
+CREATE POLICY entity_visible ON graphwright.entity
+    USING (EXISTS (
+        SELECT 1 FROM graphwright.mention mn
+        WHERE mn.entity_id = entity.id
+          AND graphwright._pk_visible(mn.watch_id, mn.source_pk)));
+
+ALTER TABLE graphwright.entity_phonetic ENABLE ROW LEVEL SECURITY;
+CREATE POLICY entity_phonetic_visible ON graphwright.entity_phonetic
+    USING (EXISTS (
+        SELECT 1 FROM graphwright.mention mn
+        WHERE mn.entity_id = entity_phonetic.entity_id
+          AND graphwright._pk_visible(mn.watch_id, mn.source_pk)));
+
+-- A per-mention override carries the row it pins; a decision is visible when
+-- one of its norms names an entity the caller can see. Both reveal names, so
+-- both are filtered like the graph itself.
+ALTER TABLE graphwright.mention_override ENABLE ROW LEVEL SECURITY;
+CREATE POLICY mention_override_visible ON graphwright.mention_override
+    USING (graphwright._pk_visible(watch_id, source_pk));
+
+ALTER TABLE graphwright.decision ENABLE ROW LEVEL SECURITY;
+CREATE POLICY decision_visible ON graphwright.decision
+    USING (EXISTS (
+        SELECT 1 FROM graphwright.entity e
+        JOIN graphwright.mention mn ON mn.entity_id = e.id
+        WHERE e.norm IN (decision.norm_a, decision.norm_b)
+          AND graphwright._pk_visible(mn.watch_id, mn.source_pk)));
+
+-- Edge visibility follows the watch's rule over its supporting rows:
+-- union (any visible) or intersection (all visible). edge_support has no
+-- policy, so the subquery sees every support and _pk_visible decides.
+ALTER TABLE graphwright.edge ENABLE ROW LEVEL SECURITY;
+CREATE POLICY edge_visible ON graphwright.edge
+    USING (
+        CASE WHEN COALESCE(
+                 (SELECT visibility FROM graphwright.watch WHERE id = watch_id), 'union'
+             ) = 'intersection'
+        THEN NOT EXISTS (
+            SELECT 1 FROM graphwright.edge_support sup
+            WHERE sup.edge_id = edge.id
+              AND NOT graphwright._pk_visible(edge.watch_id, sup.source_pk))
+        ELSE EXISTS (
+            SELECT 1 FROM graphwright.edge_support sup
+            WHERE sup.edge_id = edge.id
+              AND graphwright._pk_visible(edge.watch_id, sup.source_pk))
+        END
+    );
 "#,
         name = "catalog",
+    );
+
+    // The maintenance and review functions run as the owner, so a plain
+    // caller must not invoke them: maintenance/gc would let anyone trigger
+    // owner-context work, the review functions would let anyone rewrite the
+    // shared graph's identity, and index_dump would return raw stored
+    // surfaces past row-level security. Grant these to your operator and
+    // reviewer roles. The read accessors stay open; the catalog RLS filters
+    // them. Runs last (finalize) so the functions already exist.
+    extension_sql!(
+        r#"
+REVOKE EXECUTE ON FUNCTION graphwright.reindex(integer) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION graphwright.process_dirty(integer) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION graphwright.maintain() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION graphwright.index_dump(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION graphwright.gc(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION graphwright.merge(text, text, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION graphwright.split(text, text, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION graphwright.unmerge(text, text, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION graphwright.split_mention(text, text, text, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION graphwright.unsplit_mention(text, text, text) FROM PUBLIC;
+"#,
+        name = "lockdown_exec",
+        finalize,
     );
 
     // Register a table's text column as a document source (no index).
@@ -1529,9 +1633,13 @@ GRANT SELECT ON ALL TABLES IN SCHEMA graphwright TO PUBLIC;
         id
     }
 
+    // Maintenance runs as the extension owner (SECURITY DEFINER): it must
+    // see every source row and write the catalog past row-level security,
+    // which the owner bypasses. It never SET ROLEs, so this is permitted.
+    //
     // Rebuild the whole graph for a watch from the current source rows.
     // Shares the extraction core with the index AM's build path.
-    #[pg_extern]
+    #[pg_extern(security_definer)]
     fn reindex(watch_id: i32) -> i64 {
         super::rebuild(watch_id)
     }
@@ -1539,7 +1647,7 @@ GRANT SELECT ON ALL TABLES IN SCHEMA graphwright TO PUBLIC;
     // Apply queued row changes to the graph. A background worker calls
     // this on an interval; you can also call it directly. Returns the
     // number of queued changes applied.
-    #[pg_extern]
+    #[pg_extern(security_definer)]
     fn process_dirty(watch_id: i32) -> i64 {
         super::process_dirty(watch_id)
     }
@@ -1547,14 +1655,14 @@ GRANT SELECT ON ALL TABLES IN SCHEMA graphwright TO PUBLIC;
     // Drain the change queue for every watch (what the background worker
     // does each tick). Returns the number of changes applied. Call it
     // from pg_cron, or let the worker call it on an interval.
-    #[pg_extern]
+    #[pg_extern(security_definer)]
     fn maintain() -> i64 {
         drain_all()
     }
 
     // Read a graphwright index's per-row tokens back from its own storage.
     // Diagnostic: confirms the extraction lives in index pages.
-    #[pg_extern]
+    #[pg_extern(security_definer)]
     fn index_dump(
         index: &str,
     ) -> TableIterator<'static, (name!(ctid, String), name!(tokens, Vec<Option<String>>))> {
@@ -1563,8 +1671,7 @@ GRANT SELECT ON ALL TABLES IN SCHEMA graphwright TO PUBLIC;
 
     // Reclaim storage records for rows that no longer exist (vacuum does
     // this automatically via ambulkdelete). Returns the number removed.
-    // Run as a role that can see every row.
-    #[pg_extern]
+    #[pg_extern(security_definer)]
     fn gc(index: &str) -> i64 {
         super::gc(index)
     }
@@ -1662,18 +1769,19 @@ GRANT SELECT ON ALL TABLES IN SCHEMA graphwright TO PUBLIC;
     // Durable, reversible identity decisions. merge() forces two names to
     // one entity; split() keeps them apart (vetoing a phonetic auto-merge);
     // unmerge() drops the decision. Each re-resolves immediately and is
-    // replayed on every later re-resolve. decisions() lists them.
-    #[pg_extern]
+    // replayed on every later re-resolve. decisions() lists them. These
+    // re-resolve the graph, so they run as the owner like maintain().
+    #[pg_extern(security_definer)]
     fn merge(source_table: &str, a: &str, b: &str) -> bool {
         super::record_decision(source_table, a, b, "merge")
     }
 
-    #[pg_extern]
+    #[pg_extern(security_definer)]
     fn split(source_table: &str, a: &str, b: &str) -> bool {
         super::record_decision(source_table, a, b, "split")
     }
 
-    #[pg_extern]
+    #[pg_extern(security_definer)]
     fn unmerge(source_table: &str, a: &str, b: &str) -> bool {
         super::drop_decision(source_table, a, b)
     }
@@ -1697,7 +1805,7 @@ GRANT SELECT ON ALL TABLES IN SCHEMA graphwright TO PUBLIC;
     // separating two identical spellings the exact stage folded. tag groups
     // splits that should share one private entity (NULL: the row stands
     // alone). unsplit_mention drops it, folding them back. Both re-resolve.
-    #[pg_extern]
+    #[pg_extern(security_definer)]
     fn split_mention(
         source_table: &str,
         source_pk: &str,
@@ -1707,7 +1815,7 @@ GRANT SELECT ON ALL TABLES IN SCHEMA graphwright TO PUBLIC;
         super::record_mention_override(source_table, source_pk, surface, tag.unwrap_or(""))
     }
 
-    #[pg_extern]
+    #[pg_extern(security_definer)]
     fn unsplit_mention(source_table: &str, source_pk: &str, surface: &str) -> bool {
         super::drop_mention_override(source_table, source_pk, surface)
     }
@@ -1924,6 +2032,27 @@ mod tests {
         assert!(a.contains(&("berlin".into(), "reza".into())));
     }
 
+    // Lockdown: a direct catalog read is row-level-security filtered the same
+    // way the accessor is, so the catalog is no privileged back door.
+    #[pg_test]
+    fn direct_catalog_read_is_rls_filtered() {
+        setup();
+        // Superuser bypasses RLS and sees the whole graph: 4 entities.
+        let total = Spi::get_one::<i64>("SELECT count(*) FROM graphwright.entity")
+            .unwrap()
+            .unwrap();
+        assert_eq!(total, 4);
+        // role_b reads only row 2 (sara, berlin). The accessor shows that...
+        assert_eq!(entities_as("role_b"), vec!["berlin", "sara"]);
+        // ...and so does a direct SELECT on the catalog table: no back door.
+        Spi::run("SET ROLE role_b").unwrap();
+        let direct = Spi::get_one::<i64>("SELECT count(*) FROM graphwright.entity")
+            .unwrap()
+            .unwrap();
+        Spi::run("RESET ROLE").unwrap();
+        assert_eq!(direct, 2);
+    }
+
     // CREATE INDEX ... USING graphwright drives the same extraction with
     // ctid provenance, and the graph stays RLS-filtered per user.
     #[pg_test]
@@ -1943,6 +2072,7 @@ mod tests {
         )
         .unwrap();
         Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+        Spi::run("SELECT graphwright.maintain()").unwrap();
 
         let a = edges_as("role_a");
         assert!(a.contains(&("sara".into(), "berlin".into())));
@@ -1976,6 +2106,7 @@ mod tests {
         Spi::run("CREATE TABLE notes (id int PRIMARY KEY, owner text, body text)").unwrap();
         Spi::run("INSERT INTO notes VALUES (1, 'amir', 'Sara Tehran')").unwrap();
         Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+        Spi::run("SELECT graphwright.maintain()").unwrap();
         assert_eq!(all_entities(), vec!["sara", "tehran"]);
 
         // INSERT marks the row; extraction is async, so it is not in the
@@ -2008,6 +2139,7 @@ mod tests {
     fn maintain_drains_every_watch() {
         Spi::run("CREATE TABLE notes (id int PRIMARY KEY, owner text, body text)").unwrap();
         Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+        Spi::run("SELECT graphwright.maintain()").unwrap();
         // Insert after the (empty) build; the change is only queued.
         Spi::run("INSERT INTO notes VALUES (1, 'amir', 'Sara Tehran')").unwrap();
         assert!(all_entities().is_empty());
@@ -2027,6 +2159,7 @@ mod tests {
         Spi::run("INSERT INTO notes VALUES (1, 'amir', 'Sara Tehran'), (2, 'amir', 'Reza Berlin')")
             .unwrap();
         Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+        Spi::run("SELECT graphwright.maintain()").unwrap();
 
         let rows = Spi::connect(|client| {
             let table = client.select(
@@ -2059,6 +2192,7 @@ mod tests {
         Spi::run("INSERT INTO notes VALUES (1, 'amir', 'Sara Tehran'), (2, 'amir', 'Reza Berlin')")
             .unwrap();
         Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+        Spi::run("SELECT graphwright.maintain()").unwrap();
         let count = || {
             Spi::get_one::<i64>("SELECT count(*) FROM graphwright.index_dump('notes_kg')")
                 .unwrap()
@@ -2098,6 +2232,7 @@ mod tests {
         Spi::run("CREATE TABLE notes (id int PRIMARY KEY, owner text, body text)").unwrap();
         Spi::run("INSERT INTO notes VALUES (1, 'amir', 'had coffee with Sara in Tehran')").unwrap();
         Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+        Spi::run("SELECT graphwright.maintain()").unwrap();
 
         // Only Sara and Tehran survive, not had/coffee/with/in.
         assert_eq!(all_entities(), vec!["sara", "tehran"]);
@@ -2124,6 +2259,7 @@ mod tests {
         Spi::run("CREATE TABLE notes (id int PRIMARY KEY, owner text, body text)").unwrap();
         Spi::run("INSERT INTO notes VALUES (1, 'amir', 'sara secret tehran')").unwrap();
         Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+        Spi::run("SELECT graphwright.maintain()").unwrap();
 
         // The extractor yields sara/secret/tehran; the judge drops 'secret'.
         assert_eq!(all_entities(), vec!["sara", "tehran"]);
@@ -2137,6 +2273,7 @@ mod tests {
         // 'علي' uses Arabic yeh, 'علی' Persian yeh: same name, different codepoints.
         Spi::run("INSERT INTO notes VALUES (1, 'amir', 'علي'), (2, 'amir', 'علی')").unwrap();
         Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+        Spi::run("SELECT graphwright.maintain()").unwrap();
         assert_eq!(all_entities().len(), 1);
     }
 
@@ -2148,6 +2285,7 @@ mod tests {
         Spi::run("CREATE TABLE notes (id int PRIMARY KEY, owner text, body text)").unwrap();
         Spi::run("INSERT INTO notes VALUES (1, 'amir', 'Faeze'), (2, 'amir', 'فائزه')").unwrap();
         Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+        Spi::run("SELECT graphwright.maintain()").unwrap();
 
         let pairs: Vec<(String, String)> = Spi::connect(|client| {
             let table = client.select(
@@ -2184,6 +2322,7 @@ mod tests {
         )
         .unwrap();
         Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+        Spi::run("SELECT graphwright.maintain()").unwrap();
 
         // Khashayar ~ خشایار auto-merge (distinctive); Ali / علی stay apart
         // (too short for the gate). So: 1 merged + 2 = 3 entities.
@@ -2213,6 +2352,7 @@ mod tests {
         )
         .unwrap();
         Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+        Spi::run("SELECT graphwright.maintain()").unwrap();
 
         // ~0.87 Jaccard, both past the gate: one entity.
         assert_eq!(all_entities().len(), 1);
@@ -2230,6 +2370,7 @@ mod tests {
         Spi::run("CREATE TABLE notes (id int PRIMARY KEY, owner text, body text)").unwrap();
         Spi::run("INSERT INTO notes VALUES (1, 'amir', 'Sara'), (2, 'amir', 'Sara')").unwrap();
         Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+        Spi::run("SELECT graphwright.maintain()").unwrap();
 
         // Exact fold: two identical surfaces, one entity.
         assert_eq!(all_entities(), vec!["sara"]);
@@ -2262,6 +2403,7 @@ mod tests {
         )
         .unwrap();
         Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+        Spi::run("SELECT graphwright.maintain()").unwrap();
 
         // Ali / علی are too short for the lexical gate: three entities.
         assert_eq!(all_entities().len(), 3);
