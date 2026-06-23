@@ -10,6 +10,13 @@ They build the graph with a toy capitals-regex extractor so the demos stay
 self-contained; swap in real NER through the seam (see `gliner-extractor.sql`).
 Test data uses invented names only.
 
+**Start here:** [`diary/`](diary/) is a complete end-to-end application — a
+private journaling app whose backend is a pg_graphwright index, with a
+per-diarist app API, cross-script resolution, human review, and live updates.
+It is the use case the extension was built for.
+
+The single-feature demos below isolate one idea each:
+
 | File | What it shows | Why it matters |
 |------|---------------|----------------|
 | [`rls-visibility.sql`](rls-visibility.sql) | An entity/edge is visible exactly when the source row it came from is. A direct catalog read is filtered the same as the accessors. | The position no other knowledge-graph tool takes: graph access delegates to Postgres row-level security, with no second ACL and no back door. |
