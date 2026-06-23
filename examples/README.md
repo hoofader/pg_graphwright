@@ -15,6 +15,11 @@ private journaling app whose backend is a pg_graphwright index, with a
 per-diarist app API, cross-script resolution, human review, and live updates.
 It is the use case the extension was built for.
 
+[`enterprise/`](enterprise/) is the multi-tenant version: one company, three
+teams with different document-access rules, and a per-employee knowledge
+graph for each. It shows a sales doc shared with an engineer joining her
+graph, and leaving again when unshared, with no graph rebuild.
+
 The single-feature demos below isolate one idea each:
 
 | File | What it shows | Why it matters |
