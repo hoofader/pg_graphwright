@@ -71,10 +71,20 @@ fn run_extractor(text: &str) -> Vec<String> {
         return tokenize(text);
     }
     // name is an admin-set GUC (a function name), interpolated as-is.
-    let arr = pgrx::Spi::get_one::<Vec<Option<String>>>(&format!("SELECT {}({})", name, lit(text)))
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+    // A failing extractor (bad SQL, type mismatch, HTTP timeout for the
+    // gliner path) must not silently empty the graph for that row: warn so
+    // the operator sees a misconfigured extractor instead of missing data.
+    let arr =
+        match pgrx::Spi::get_one::<Vec<Option<String>>>(&format!("SELECT {}({})", name, lit(text)))
+        {
+            Ok(v) => v.unwrap_or_default(),
+            Err(e) => {
+                pgrx::warning!(
+                    "graphwright: extractor {name} failed, treating as no surfaces: {e}"
+                );
+                Vec::new()
+            }
+        };
     arr.into_iter().flatten().collect()
 }
 
@@ -103,17 +113,20 @@ fn judge(text: &str, surfaces: Vec<String>) -> Vec<String> {
                 .join(", ")
         )
     };
+    // A judge error or NULL keeps the extractor's output unchanged, but a
+    // raised error is a misconfiguration the operator should see.
     match pgrx::Spi::get_one::<Vec<Option<String>>>(&format!(
         "SELECT {}({}, {})",
         name,
         lit(text),
         array
-    ))
-    .ok()
-    .flatten()
-    {
-        Some(judged) => judged.into_iter().flatten().collect(),
-        None => surfaces,
+    )) {
+        Ok(Some(judged)) => judged.into_iter().flatten().collect(),
+        Ok(None) => surfaces,
+        Err(e) => {
+            pgrx::warning!("graphwright: judge {name} failed, keeping extractor output: {e}");
+            surfaces
+        }
     }
 }
 
@@ -758,16 +771,29 @@ mod storage {
     }
 
     pub fn decode(data: &[u8]) -> (u8, u32, u16, Vec<String>) {
+        // A record is tag(1) + block(4) + offset(2) = 7 bytes minimum. We
+        // wrote it, so a short or truncated record means corruption; degrade
+        // to an empty marker rather than panic while a scan holds a buffer
+        // lock (a panic there becomes a PANIC, not a recoverable ERROR).
+        if data.len() < 7 {
+            return (super::MARKER, 0, 0, Vec::new());
+        }
         let tag = data[0];
         let block = u32::from_le_bytes(data[1..5].try_into().unwrap());
         let offset = u16::from_le_bytes(data[5..7].try_into().unwrap());
         let mut surfaces = Vec::new();
-        if tag == super::MENTIONS {
+        if tag == super::MENTIONS && data.len() >= 9 {
             let n = u16::from_le_bytes(data[7..9].try_into().unwrap()) as usize;
             let mut pos = 9;
             for _ in 0..n {
+                if pos + 2 > data.len() {
+                    break;
+                }
                 let len = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
                 pos += 2;
+                if pos + len > data.len() {
+                    break;
+                }
                 surfaces.push(String::from_utf8_lossy(&data[pos..pos + len]).into_owned());
                 pos += len;
             }
@@ -1494,10 +1520,11 @@ CREATE TABLE graphwright.dirty (
 );
 
 -- The capture trigger. SECURITY DEFINER so a writer who lacks rights on
--- the queue can still enqueue. Names are schema-qualified, so the
--- definer's search_path does not matter.
+-- the queue can still enqueue. search_path is pinned and every name is
+-- schema-qualified, so a caller cannot shadow a referenced object via
+-- pg_temp.
 CREATE FUNCTION graphwright._enqueue() RETURNS trigger
-    LANGUAGE plpgsql SECURITY DEFINER AS $enqueue$
+    LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $enqueue$
 BEGIN
     -- Provenance is the watch's pk column. The index path uses 'ctid' (a
     -- system column, absent from row_to_json), so it is read directly.
@@ -1528,7 +1555,7 @@ GRANT SELECT ON ALL TABLES IN SCHEMA graphwright TO PUBLIC;
 -- the probe runs the source table's row-level security as the caller. This
 -- is the bridge that carries the source's RLS onto the derived graph.
 CREATE FUNCTION graphwright._pk_visible(wid integer, pk text) RETURNS boolean
-    LANGUAGE plpgsql STABLE SECURITY INVOKER AS $pkv$
+    LANGUAGE plpgsql STABLE SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS $pkv$
 DECLARE
     tbl text;
     col text;
@@ -1550,7 +1577,7 @@ $pkv$;
 -- these itself; reading edge_support directly would instead be filtered to
 -- the visible supports and lose the ones intersection needs to count.
 CREATE FUNCTION graphwright._edge_supports(eid bigint) RETURNS SETOF text
-    LANGUAGE sql STABLE SECURITY DEFINER AS $es$
+    LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $es$
     SELECT source_pk FROM graphwright.edge_support WHERE edge_id = eid
 $es$;
 
@@ -1629,12 +1656,14 @@ CREATE POLICY edge_support_visible ON graphwright.edge_support
     // The maintenance and review functions run as the owner, so a plain
     // caller must not invoke them: maintenance/gc would let anyone trigger
     // owner-context work, the review functions would let anyone rewrite the
-    // shared graph's identity, and index_dump would return raw stored
-    // surfaces past row-level security. Grant these to your operator and
-    // reviewer roles. The read accessors stay open; the catalog RLS filters
-    // them. Runs last (finalize) so the functions already exist.
+    // shared graph's identity, index_dump would return raw stored surfaces
+    // past row-level security, and watch installs a capture trigger on a
+    // named table and seeds extension state. Grant these to your operator
+    // and reviewer roles. The read accessors stay open; the catalog RLS
+    // filters them. Runs last (finalize) so the functions already exist.
     extension_sql!(
         r#"
+REVOKE EXECUTE ON FUNCTION graphwright.watch(text, text, text) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION graphwright.reindex(integer) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION graphwright.process_dirty(integer) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION graphwright.maintain() FROM PUBLIC;

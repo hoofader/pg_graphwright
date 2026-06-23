@@ -13,9 +13,15 @@ env:
 
 jobs:
   test:
-    name: fmt + clippy + pgrx test (pg17)
+    name: fmt + clippy + pgrx test (${{ matrix.pg }})
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        # The newest major and an older one, so AM/page/ABI drift across
+        # majors is caught instead of assumed.
+        pg: [pg15, pg18]
     steps:
       - uses: actions/checkout@v4
 
@@ -50,17 +56,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.pgrx
-          key: pgrx-${{ env.PGRX_VERSION }}-pg17-${{ runner.os }}
+          key: pgrx-${{ env.PGRX_VERSION }}-${{ matrix.pg }}-${{ runner.os }}
 
-      # Builds Postgres 17 on a cache miss; detects and reuses it on a hit.
+      # Builds the target major on a cache miss; detects and reuses it on a hit.
       - name: Initialize pgrx
-        run: cargo pgrx init --pg17 download
+        run: cargo pgrx init --${{ matrix.pg }} download
 
       - name: Format
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --no-default-features --features pg17 --tests -- -D warnings
+        run: cargo clippy --no-default-features --features ${{ matrix.pg }} --tests -- -D warnings
 
       - name: Test
-        run: cargo pgrx test pg17
+        run: cargo pgrx test ${{ matrix.pg }}

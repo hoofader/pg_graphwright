@@ -1,18 +1,32 @@
 # pg_graphwright
 
-A knowledge-graph index for Postgres, where each user sees only the part of the graph derived from rows they are allowed to read.
+[![CI](https://github.com/hoofader/pg_graphwright/actions/workflows/ci.yml/badge.svg)](https://github.com/hoofader/pg_graphwright/actions/workflows/ci.yml)
 
-pg_graphwright builds an entity graph (people, places, things and the relationships between them) from the documents in your tables, and keeps it as Postgres-managed state. The position no other system takes: **a graph element's visibility follows the row-level security of its source rows.** If a user cannot read the note that a fact came from, that user does not see the fact. There is no second access-control system to keep in sync with your data; the extension delegates to Postgres RLS.
+A knowledge graph that lives inside Postgres and inherits your row-level security. If a user cannot read the row, they cannot see the fact derived from it.
+
+pg_graphwright builds an entity graph (people, places, things, and the links between them) from the documents in your tables and keeps it as Postgres-managed state. The position no other system takes: **a graph element's visibility follows the row-level security of its source rows.** There is no second access-control system to keep in sync with your data. For multi-tenant apps that already use Postgres RLS and want an entity graph over their documents, that means no second database and no second permission model.
+
+(`graphwright`, as in a wheelwright: a maker of graphs.)
+
+```
+   one table: notes(owner, body)   +   your RLS policy
+                       |
+       +---------------+---------------+
+   SET ROLE amir                   SET ROLE nadia
+       |                               |
+   edges('notes')                  edges('notes')
+       |                               |
+   Sara -- Tehran                  Sara -- Berlin
+   (row 1 only)                    (row 2 only)
+```
+
+Same table, same query, two users, two different graphs. The RLS you already wrote decides what each one contains.
 
 This is the Postgres-native sibling of [graphwright](https://github.com/hoofader/graphwright) (the storage-agnostic TypeScript core) and [graphwright-onnx](https://github.com/hoofader/graphwright-onnx) (the no-LLM extraction backend). The planning logic lives there; this repo is where it becomes an index.
 
-## Status
-
-Early, but the storage model is now the Postgres-native one. `CREATE INDEX ... USING graphwright (body)` stores each row's extraction in the **index relation's own pages** (WAL-logged through generic WAL, like pg_search), so it is transactional with the heap and travels with physical replication. `aminsert` writes only a tiny marker on a write, and `CREATE INDEX` itself only marks rows; the extractor, judge, and resolved graph build on the next `graphwright.maintain()` (or background-worker) tick, which runs as the extension owner so it sees every row. A slow model never blocks a write. `ambulkdelete` reclaims deleted rows' records on vacuum. The cross-row resolved graph (entities/edges) is derived from index storage into catalog tables that carry **row-level security** so a graph row is visible exactly when the source row(s) behind it are; the accessors and a direct catalog read are filtered the same way. Extraction and judging are pluggable extension points (`graphwright.extractor`, `graphwright.judge`), defaulting to a built-in tokenizer and no judge. Resolution folds entity surfaces on a normalized key (Arabic/Persian variants meet), and auto-merges distinctive cross-script phonetic and 3-gram fuzzy matches (both gated by entropy). It never waits: every merge is recorded in a durable, reversible decision log a human edits after the fact (SAGA-style, down to splitting a single mention out of an exact fold), and `graphwright.proposals()` shows the matches the gate left for review. Resolution normalizes through NFKC (so compatibility forms, presentation forms, and ligatures fold), the Arabic/Persian script folds, and diacritic stripping, and carries Latin, Persian, and Cyrillic phonetic schemes. Every content table is under row-level security. The core is in place.
-
-What is already proven is the part nobody else ships: row-derived graph visibility.
-
 ## Try it
+
+Requires superuser on a self-managed Postgres (it ships an index access method and a background worker, so managed services like RDS or Cloud SQL will reject `CREATE EXTENSION` until it is allow-listed).
 
 ```sql
 CREATE EXTENSION pg_graphwright;
@@ -29,14 +43,39 @@ INSERT INTO notes VALUES
 -- Build the knowledge-graph index over the body column.
 CREATE INDEX notes_kg ON notes USING graphwright (body);
 
--- amir sees only the graph from row 1; nadia only from row 2.
-SET ROLE amir;
-SELECT * FROM graphwright.edges('notes');
+-- Extraction and resolution run off the write path, so the graph is empty
+-- until a maintenance tick (or the background worker) runs.
+SELECT graphwright.maintain();
+
+-- amir and nadia run the same query and get different graphs.
+SET ROLE amir;  SELECT * FROM graphwright.edges('notes');   -- Sara -- Tehran
+RESET ROLE;
+SET ROLE nadia; SELECT * FROM graphwright.edges('notes');   -- Sara -- Berlin
 ```
 
-`graphwright.watch(table, text_col, pk_col)` + `graphwright.reindex(id)` are also exposed for building the graph without an index (with a primary-key column as provenance instead of `ctid`).
-
 Runnable demos are in [`examples/`](examples/): a complete [diary application](examples/diary/) (the end-to-end use case), plus single-feature demos for row-level-security-derived visibility, `union` vs `intersection` edge disclosure, and cross-script resolution with reversible review.
+
+## Why not just...
+
+- **A graph database (Neo4j, etc.)?** It owns the data and the access control. You then run two systems and two copies of "who can see what," and they drift. Here the graph lives in Postgres and there is one ACL: your existing RLS.
+- **`pgvector` / a vector search?** Different job. That finds similar text. This builds an entity graph (people, places, the links between them) and resolves `Sara`/`Sarah`/`سارا` to one identity, with a human able to overrule a merge after the fact.
+- **Doing it by hand?** The hard parts are the ones that are easy to get wrong: an edge backed by N rows with N different ACLs, cross-script identity resolution, and a reversible decision log. That is the extension.
+
+## How the visibility is enforced
+
+The catalog tables carry their own row-level security. A `SECURITY INVOKER` function `graphwright._pk_visible(watch_id, source_pk)` runs an `EXISTS` against the source table, so the source's RLS decides as the calling user. The `entity`/`mention`/`edge`/`entity_phonetic`/`decision`/`mention_override` policies build on it. A direct `SELECT * FROM graphwright.entity` is filtered the same as the accessor, so the accessor is no privileged back door:
+
+```sql
+SET ROLE analyst_without_access;
+SELECT count(*) FROM graphwright.entity;   -- only entities from rows analyst can read
+```
+
+Two things worth being precise about:
+
+- **Names are union-visible.** An entity (a name) is visible when at least one mention's source row is readable. The `union`/`intersection` rule below governs *edge* disclosure, not whether a name appears: a single readable row already justifies the name to that user.
+- **The accessors are the hot path.** `entities`/`edges`/`mentions` join the source table once. A direct catalog read is filtered identically but probes visibility per row, so treat it as an audit and proof path, not a query you run in a loop.
+
+Maintenance runs as the extension owner (which bypasses RLS, so the graph is built over every row). The maintenance and review functions (`maintain`, `reindex`, `gc`, `watch`, `merge`/`split`/`unmerge`, `split_mention`/`unsplit_mention`, `index_dump`) have `EXECUTE` revoked from `PUBLIC`; grant those to your operator and reviewer roles. The owner must be able to read every source row (a superuser, a `BYPASSRLS` role, or the table owner) for extraction to be complete.
 
 ## Edge visibility
 
@@ -50,16 +89,11 @@ UPDATE graphwright.watch SET visibility = 'intersection'
   WHERE source_table = 'notes'::regclass;
 ```
 
-## How the visibility is enforced
+## How it works
 
-The catalog tables carry their own row-level security. A `SECURITY INVOKER` function `graphwright._pk_visible(watch_id, source_pk)` runs an `EXISTS` against the source table, so the source's RLS decides as the calling user; the `entity`/`mention`/`edge`/`entity_phonetic`/`decision`/`mention_override` policies build on it. So a direct `SELECT * FROM graphwright.entity` is filtered the same as the accessor, and the accessor is no privileged back door:
+`CREATE INDEX ... USING graphwright (body)` stores each row's extraction in the **index relation's own pages**, WAL-logged through generic WAL (the same approach as pg_search). It is transactional with the heap and travels with physical replication. `aminsert` writes only a small marker on a write, and `CREATE INDEX` itself only marks rows. The extractor, the judge, and the resolved cross-row graph build on the next `graphwright.maintain()` (or background-worker) tick, which runs as the extension owner so it sees every row. A slow model never blocks a write. `ambulkdelete` reclaims a deleted row's records on vacuum.
 
-```sql
-SET ROLE analyst_without_access;
-SELECT count(*) FROM graphwright.entity;   -- only entities from rows analyst can read
-```
-
-Maintenance runs as the extension owner (which bypasses RLS, so the graph is built over every row) and the maintenance and review functions (`maintain`, `reindex`, `gc`, `merge`/`split`/`unmerge`, `split_mention`/`unsplit_mention`, `index_dump`) have `EXECUTE` revoked from `PUBLIC`. Grant those to your operator and reviewer roles. The owner must be able to read every source row (a superuser, a `BYPASSRLS` role, or the table owner) for extraction to be complete.
+The cross-row resolved graph (entities and edges) is derived from that index storage into catalog tables that carry row-level security, so a graph row is visible exactly when the source rows behind it are. See [Resolution](#resolution) for how surfaces fold into entities.
 
 ## Live maintenance
 
@@ -79,7 +113,7 @@ graphwright.database = 'mydb'
 
 Splitting the synchronous storage write from the async resolve is deliberate: extraction is a fast stub today, but when it becomes LLM-backed, the per-row tokens are still captured transactionally while the expensive resolution stays off the writing transaction.
 
-There is also a no-index path (`graphwright.watch(table, text_col, pk_col)` + `graphwright.reindex(id)`) that builds the graph straight from source rows, with a trigger-fed queue (`graphwright.process_dirty(id)`) for incremental updates. Use it when you want the graph without `CREATE INDEX`.
+There is also a no-index path (`graphwright.watch(table, text_col, pk_col)` + `graphwright.reindex(id)`) that builds the graph straight from source rows, with a trigger-fed queue (`graphwright.process_dirty(id)`) for incremental updates. Use it when you want the graph without `CREATE INDEX`, with a primary-key column as provenance instead of `ctid`.
 
 ## Extraction
 
@@ -93,7 +127,7 @@ $$;
 SET graphwright.extractor = 'caps';
 ```
 
-The function can wrap anything: a regex NER, an LLM gateway over `pg_net`, or GLiNER through [graphwright-onnx](https://github.com/hoofader/graphwright-onnx). For GLiNER, run its HTTP service and point the extension point at it with [`examples/gliner-extractor.sql`](examples/gliner-extractor.sql) (a `pgsql-http` function that POSTs the document and returns the surfaces). It runs asynchronously (the maintenance pass), so a slow model is fine; a write only records a marker.
+The function can wrap anything: a regex NER, an LLM gateway over `pg_net`, or GLiNER through [graphwright-onnx](https://github.com/hoofader/graphwright-onnx). For GLiNER, run its HTTP service and point the extension point at it with [`examples/gliner-extractor.sql`](examples/gliner-extractor.sql) (a `pgsql-http` function that POSTs the document and returns the surfaces). It runs asynchronously (the maintenance pass), so a slow model is fine; a write only records a marker. A failing extractor warns and is treated as no surfaces for that row, so a misconfiguration is visible rather than silent.
 
 A second extension point validates the result. `graphwright.judge` names a function `j(text, text[]) -> text[]` (a larger model) that trims or vets the extractor's mentions before they reach the graph:
 
@@ -139,6 +173,12 @@ SELECT graphwright.unsplit_mention('notes', '(0,2)', 'Sara');  -- fold it back
 
 Each applies immediately and is reversible: edit or delete the underlying row and the graph re-derives without it.
 
+## Status
+
+Early preview. The storage model is the Postgres-native one and the row-derived visibility is real and tested. Extraction defaults to a built-in tokenizer; the LLM/GLiNER lane is a pluggable extension point. The resolution cascade, the reversible decision log, and the RLS enforcement work and are covered by `cargo pgrx test`.
+
+0.x has no in-place upgrade path: the catalog schema may change between previews, so drop and recreate the extension rather than `ALTER EXTENSION ... UPDATE`. A versioned upgrade story comes before the first release you are expected to keep.
+
 ## Build
 
 ```bash
@@ -147,7 +187,7 @@ cargo pgrx test pg17          # run the regression tests
 ./scripts/smoke-bgworker.sh   # end-to-end check of the background worker
 ```
 
-Requires the pgrx toolchain (`cargo install cargo-pgrx`, then `cargo pgrx init`). Built against `pgrx 0.18`. The background worker needs `shared_preload_libraries` and a restart, so it cannot run in `cargo pgrx test`; `scripts/smoke-bgworker.sh` exercises it against a throwaway cluster instead.
+Requires the pgrx toolchain (`cargo install cargo-pgrx`, then `cargo pgrx init`). Built against `pgrx 0.18`. CI runs the suite on PG15 and PG18; the extension is built with pgrx for PG13 through PG18. The background worker needs `shared_preload_libraries` and a restart, so it cannot run in `cargo pgrx test`; `scripts/smoke-bgworker.sh` exercises it against a throwaway cluster instead.
 
 ## License
 
