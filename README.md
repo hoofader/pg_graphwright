@@ -8,19 +8,9 @@ pg_graphwright builds an entity graph (people, places, things, and the links bet
 
 (`graphwright`, as in a wheelwright: a maker of graphs.)
 
-```
-   one table: notes(owner, body)   +   your RLS policy
-                       |
-       +---------------+---------------+
-   SET ROLE amir                   SET ROLE nadia
-       |                               |
-   edges('notes')                  edges('notes')
-       |                               |
-   Sara -- Tehran                  Sara -- Berlin
-   (row 1 only)                    (row 2 only)
-```
+![Emma and Jack keep separate diaries in one table. The same query returns a different graph for each, because row-level security decides what each can read.](examples/diary/demo.gif)
 
-Same table, same query, two users, two different graphs. The RLS you already wrote decides what each one contains.
+Same table, same query, two users, two different graphs. The row-level security you already wrote decides what each one contains. This is the [diary example](examples/diary/) running.
 
 This is the Postgres-native sibling of [graphwright](https://github.com/hoofader/graphwright) (the storage-agnostic TypeScript core) and [graphwright-onnx](https://github.com/hoofader/graphwright-onnx) (the no-LLM extraction backend). The planning logic lives there; this repo is where it becomes an index.
 
