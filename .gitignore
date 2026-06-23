@@ -1,6 +1,8 @@
 .DS_Store
 .idea/
 /target
+LAUNCH.md
+examples/diary/demo.cast
 *.iml
 **/*.rs.bk
 tests/pg_regress/results
