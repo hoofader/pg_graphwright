@@ -5,6 +5,11 @@ shared document store where every employee's knowledge graph is exactly the
 documents they are allowed to read. It is the same idea as the diary example,
 scaled from one-owner-per-row to real role-based access with sharing.
 
+![Kimi (engineering) and Joe (sales) have different graphs. Joe shares the Globex account doc with Kimi and it joins her graph (Globex, Joe, Nadia); he unshares it and it leaves, with no graph rebuild.](demo.gif)
+
+Joe shares one sales document with Kimi and it joins her graph; he unshares it
+and it leaves, with no `graphwright.maintain()` in between.
+
 ```bash
 psql -f examples/enterprise/schema.sql   # the reusable schema (run once)
 psql -f examples/enterprise/demo.sql      # the walkthrough

@@ -2,7 +2,7 @@
 .idea/
 /target
 LAUNCH.md
-examples/diary/demo.cast
+examples/*/demo.cast
 *.iml
 **/*.rs.bk
 tests/pg_regress/results
