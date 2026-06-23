@@ -73,9 +73,11 @@ a view over it.
 
 ## Honest scope
 
-Edges are co-mention only (two names in the same document), not typed
-relationships. Identity is resolved globally by name while visibility is per
-employee, so two different people who share a name need
+Edges in this demo are co-mention (two names in the same document). For
+directed, typed relationships (who reports to whom, who closed which deal),
+point `graphwright.relation_extractor` at a relation function (see
+`../typed-edges.sql`). Identity is resolved globally by name while visibility
+is per employee, so two different people who share a name need
 `graphwright.split_mention` to stay apart (see `../identity-resolution.sql`).
 The toy capitals extractor is a stand-in for real NER through the extension
 point (`../gliner-extractor.sql`). The share authorization here is deliberately

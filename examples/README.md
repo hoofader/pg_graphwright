@@ -28,6 +28,7 @@ The single-feature demos below isolate one idea each:
 | [`edge-disclosure.sql`](edge-disclosure.sql) | A relationship supported by several rows is disclosed under a per-watch rule: `union` (read any supporting row) or `intersection` (read every one). | Need-to-know on relationships, not just rows. Nothing else models an edge backed by N rows with N different ACLs. |
 | [`identity-resolution.sql`](identity-resolution.sql) | Cross-script names auto-merge (`Khashayar`/`خشایار`, `Khabarov`/`Хабаров`); short ambiguous ones become review proposals; every merge/split is durable and reversible, down to splitting two identical spellings apart. | Deterministic, multilingual resolution with a human who can overrule it after the fact. Apply-then-review, not a baked-in pipeline side effect. |
 | [`gliner-extractor.sql`](gliner-extractor.sql) | Point `graphwright.extractor` at a GLiNER model service (via `pgsql-http`). | The extractor is a model-agnostic SQL-function extension point; no model runtime in the backend. |
+| [`typed-edges.sql`](typed-edges.sql) | Point `graphwright.relation_extractor` at a function returning `(subject, predicate, object)` triples, and co-mention edges become directed, typed relations. | Relationships carry meaning (`closed`, `manages`, `reports_to`), not just "appeared together", through the same extension-point shape as entity extraction. |
 
 Two things every example does, because they trip people up:
 

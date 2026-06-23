@@ -130,6 +130,23 @@ SET graphwright.judge = 'vet';
 
 This is the "AI output is never canon" step: the small model proposes mentions, the larger model disposes. A judge error or NULL leaves the extractor's output unchanged.
 
+### Typed edges
+
+By default an edge means co-mention: two names appeared in the same row, undirected. Point `graphwright.relation_extractor` at a SQL function `f(text) -> text[]` that returns flattened `(subject, predicate, object)` triples, and edges become directed and typed instead.
+
+```sql
+-- a toy relation extractor: "X manages Y" -> (X, manages, Y)
+CREATE FUNCTION rels(doc text) RETURNS text[] LANGUAGE sql AS $$
+  SELECT array_agg(part ORDER BY ord, idx)
+  FROM (SELECT row_number() OVER () AS ord, m
+        FROM regexp_matches(doc, '([[:upper:]]\w+) (manages|closed) ([[:upper:]]\w+)', 'g') AS m) t,
+       LATERAL unnest(ARRAY[m[1], m[2], m[3]]) WITH ORDINALITY AS u(part, idx)
+$$;
+SET graphwright.relation_extractor = 'rels';
+```
+
+Endpoints resolve to entities the same way surfaces do, so only relations between extracted entities become edges, and `merge`/`split` still apply to them. A real deployment points this at an LLM or a relation model. See [`examples/typed-edges.sql`](examples/typed-edges.sql).
+
 ## Resolution
 
 A mention's surface resolves to an entity by **exact match on a normalized key** (ported from the graphwright core): NFKC, then Arabic vs Persian yeh/kaf, alef variants, diacritics, tatweel, ZWNJ joins, case, and surrounding punctuation all fold, so `علي` and `علی` are one entity, and `Ｒｅｚａ` is `reza`.

@@ -99,7 +99,8 @@ SET ROLE dana;
 SELECT count(*) AS entities_dana_can_see FROM graphwright.entity;
 RESET ROLE;
 
--- Note on scope: edges are co-mention only (two names in the same doc), not
--- typed relationships, and identity is resolved globally by name while
--- visibility is per employee. The toy capitals extractor is a stand-in for
--- real NER through the extension point (see ../gliner-extractor.sql).
+-- Note on scope: edges here are co-mention (two names in the same doc); for
+-- directed, typed relationships set graphwright.relation_extractor (see
+-- ../typed-edges.sql). Identity is resolved globally by name while visibility
+-- is per employee. The toy capitals extractor is a stand-in for real NER
+-- through the extension point (see ../gliner-extractor.sql).

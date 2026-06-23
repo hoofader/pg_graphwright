@@ -130,6 +130,44 @@ fn judge(text: &str, surfaces: Vec<String>) -> Vec<String> {
     }
 }
 
+// The relation extension point: graphwright.relation_extractor names a
+// function `f(text) -> text[]`, a flat list of (subject, predicate, object)
+// triples. When set, edges are the directed, typed relations it returns;
+// empty falls back to undirected co-mention. Endpoints resolve to entities
+// the same way surfaces do, so only relations between extracted entities
+// become edges. The model proposes; a human can still split or merge.
+fn run_relation_extractor(text: &str) -> Vec<(String, String, String)> {
+    let Some(name) = RELATION_EXTRACTOR.get() else {
+        return Vec::new();
+    };
+    let name = name.to_string_lossy();
+    if name.trim().is_empty() {
+        return Vec::new();
+    }
+    let flat =
+        match pgrx::Spi::get_one::<Vec<Option<String>>>(&format!("SELECT {}({})", name, lit(text)))
+        {
+            Ok(v) => v.unwrap_or_default(),
+            Err(e) => {
+                pgrx::warning!(
+                    "graphwright: relation extractor {name} failed, treating as no relations: {e}"
+                );
+                Vec::new()
+            }
+        };
+    let flat: Vec<String> = flat.into_iter().flatten().collect();
+    flat.chunks_exact(3)
+        .map(|c| (c[0].clone(), c[1].clone(), c[2].clone()))
+        .collect()
+}
+
+fn relation_extractor_set() -> bool {
+    RELATION_EXTRACTOR
+        .get()
+        .map(|n| !n.to_string_lossy().trim().is_empty())
+        .unwrap_or(false)
+}
+
 // The embedding extension point: graphwright.embedder names a function
 // `f(text) -> float8[]`. It embeds each norm and merges pairs whose cosine
 // clears graphwright.embedding_threshold, rescuing short names the lexical
@@ -269,12 +307,42 @@ fn resolve_from_storage(indexrel: pg_sys::Relation, watch_id: i32) {
     let canon = canonical_map(&norms, &merges);
     let overrides = read_overrides(watch_id);
 
+    // Typed edges need the row text, which is not in index storage. When a
+    // relation extractor is set, re-read each row's body by ctid to run it;
+    // otherwise edges are co-mention over the stored tokens.
+    let text_source: Option<(String, String)> = relation_extractor_set()
+        .then(|| {
+            Spi::get_two::<String, String>(&format!(
+                "SELECT source_table::text, text_column FROM graphwright.watch WHERE id = {watch_id}"
+            ))
+            .ok()
+            .and_then(|(t, c)| Some((t?, c?)))
+        })
+        .flatten();
+
     Spi::run(&format!(
         "DELETE FROM graphwright.entity WHERE watch_id = {watch_id}"
     ))
     .expect("clear watch");
     for (ctid, surfaces) in &records {
-        resolve_tokens(watch_id, ctid, surfaces, &canon, &overrides);
+        let relations = text_source.as_ref().map(|(tbl, col)| {
+            let body = Spi::get_one::<String>(&format!(
+                "SELECT ({col})::text FROM {tbl} WHERE ctid = '{ctid}'::tid",
+                col = ident(col),
+            ))
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+            run_relation_extractor(&body)
+        });
+        resolve_tokens(
+            watch_id,
+            ctid,
+            surfaces,
+            &canon,
+            &overrides,
+            relations.as_deref(),
+        );
     }
 }
 
@@ -547,41 +615,76 @@ fn rebuild(watch_id: i32) -> i64 {
 // Add one row's contribution from its source text (tokenize, then
 // resolve). Used by the no-index reindex path.
 fn index_row(watch_id: i32, source_pk: &str, body: &str) -> i64 {
+    let relations = relation_extractor_set().then(|| run_relation_extractor(body));
     resolve_tokens(
         watch_id,
         source_pk,
         &extract(body),
         &std::collections::HashMap::new(),
         &read_overrides(watch_id),
+        relations.as_deref(),
     )
 }
 
-// Resolve a row's already-extracted tokens into entities, mentions, and
-// co-mention edges, tagged with the row's provenance. The index path
-// feeds tokens read from index storage; the reindex path tokenizes first.
+// The canonical entity key for a surface at a row: normalize, fold through
+// the cross-row merge map, then apply any per-mention override that forks
+// this occurrence onto a private key. None when the surface normalizes away.
+fn entity_key_for(
+    surface: &str,
+    source_pk: &str,
+    canon: &std::collections::HashMap<String, String>,
+    overrides: &std::collections::HashMap<(String, String), String>,
+) -> Option<String> {
+    let norm = normalize_name(surface);
+    if norm.is_empty() {
+        return None;
+    }
+    let canon_key = canon.get(&norm).cloned().unwrap_or_else(|| norm.clone());
+    Some(match overrides.get(&(source_pk.to_string(), norm)) {
+        Some(tag) => format!("{canon_key}{OVERRIDE_SEP}{tag}"),
+        None => canon_key,
+    })
+}
+
+// Upsert one edge and record the row as its provenance. predicate carries
+// the relation type; co-mention edges use 'co_mentioned'.
+fn insert_edge(watch_id: i32, src: i64, dst: i64, predicate: &str, source_pk: &str) {
+    use pgrx::Spi;
+    let edge_id = Spi::get_one::<i64>(&format!(
+        "INSERT INTO graphwright.edge (watch_id, src, dst, predicate) \
+         VALUES ({watch_id}, {src}, {dst}, {pred}) \
+         ON CONFLICT (watch_id, src, dst, predicate) DO UPDATE SET predicate = EXCLUDED.predicate \
+         RETURNING id",
+        pred = lit(predicate),
+    ))
+    .expect("edge upsert")
+    .expect("edge id");
+    Spi::run(&format!(
+        "INSERT INTO graphwright.edge_support (edge_id, watch_id, source_pk) \
+         VALUES ({edge_id}, {watch_id}, {pk}) ON CONFLICT DO NOTHING",
+        pk = lit(source_pk),
+    ))
+    .expect("edge support");
+}
+
+// Resolve a row's extracted tokens into entities and mentions, then build
+// edges, tagged with the row's provenance. With `relations`, edges are the
+// directed, typed triples; without, consecutive entities are co-mention.
 fn resolve_tokens(
     watch_id: i32,
     source_pk: &str,
     tokens: &[String],
     canon: &std::collections::HashMap<String, String>,
     overrides: &std::collections::HashMap<(String, String), String>,
+    relations: Option<&[(String, String, String)]>,
 ) -> i64 {
     use pgrx::Spi;
     let mut ids: Vec<i64> = Vec::new();
+    let mut by_key: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     let mut mentions = 0i64;
     for tok in tokens {
-        // Entities are keyed by the canonical norm: exact folds variants,
-        // and canon merges what a decision or a gated phonetic match links.
-        let norm = normalize_name(tok);
-        if norm.is_empty() {
+        let Some(entity_key) = entity_key_for(tok, source_pk, canon, overrides) else {
             continue;
-        }
-        let canon_key = canon.get(&norm).cloned().unwrap_or_else(|| norm.clone());
-        // A per-mention override forks this one occurrence onto a private
-        // key, so a human can separate it from the exact-folded entity.
-        let entity_key = match overrides.get(&(source_pk.to_string(), norm)) {
-            Some(tag) => format!("{canon_key}{OVERRIDE_SEP}{tag}"),
-            None => canon_key,
         };
         let entity_id = Spi::get_one::<i64>(&format!(
             "INSERT INTO graphwright.entity (watch_id, surface, norm) VALUES ({watch_id}, {surf}, {norm}) \
@@ -609,26 +712,37 @@ fn resolve_tokens(
         .expect("mention insert");
         mentions += 1;
         ids.push(entity_id);
+        by_key.insert(entity_key, entity_id);
     }
-    for pair in ids.windows(2) {
-        let (a, b) = (pair[0], pair[1]);
-        if a == b {
-            continue;
+    match relations {
+        // Only relations whose subject and object were both extracted become
+        // edges, so an edge never points at an entity with no mention behind
+        // it (which the orphan cleanup would later drop).
+        Some(triples) => {
+            for (subject, predicate, object) in triples {
+                let (Some(sk), Some(ok)) = (
+                    entity_key_for(subject, source_pk, canon, overrides),
+                    entity_key_for(object, source_pk, canon, overrides),
+                ) else {
+                    continue;
+                };
+                if let (Some(&s), Some(&o)) = (by_key.get(&sk), by_key.get(&ok)) {
+                    if s != o {
+                        insert_edge(watch_id, s, o, predicate, source_pk);
+                    }
+                }
+            }
         }
-        let (src, dst) = if a < b { (a, b) } else { (b, a) };
-        let edge_id = Spi::get_one::<i64>(&format!(
-            "INSERT INTO graphwright.edge (watch_id, src, dst) VALUES ({watch_id}, {src}, {dst}) \
-             ON CONFLICT (watch_id, src, dst, predicate) DO UPDATE SET predicate = EXCLUDED.predicate \
-             RETURNING id",
-        ))
-        .expect("edge upsert")
-        .expect("edge id");
-        Spi::run(&format!(
-            "INSERT INTO graphwright.edge_support (edge_id, watch_id, source_pk) \
-             VALUES ({edge_id}, {watch_id}, {pk}) ON CONFLICT DO NOTHING",
-            pk = lit(source_pk),
-        ))
-        .expect("edge support");
+        None => {
+            for pair in ids.windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                if a == b {
+                    continue;
+                }
+                let (src, dst) = if a < b { (a, b) } else { (b, a) };
+                insert_edge(watch_id, src, dst, "co_mentioned", source_pk);
+            }
+        }
     }
     mentions
 }
@@ -1274,6 +1388,7 @@ use std::time::Duration;
 static MAINTENANCE_DATABASE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 static EXTRACTOR: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 static JUDGE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+static RELATION_EXTRACTOR: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 static EMBEDDER: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 static EMBEDDING_THRESHOLD: GucSetting<f64> = GucSetting::<f64>::new(0.83);
 
@@ -1365,6 +1480,14 @@ pub extern "C-unwind" fn _PG_init() {
         c"SQL function j(text, text[]) -> text[] that validates the extractor output.",
         c"Empty applies no judge. A larger model can drop or keep mentions here.",
         &JUDGE,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"graphwright.relation_extractor",
+        c"SQL function f(text) -> text[] of flattened (subject, predicate, object) triples.",
+        c"Empty falls back to undirected co-mention edges. Set it for typed, directed edges.",
+        &RELATION_EXTRACTOR,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -2303,6 +2426,73 @@ mod tests {
 
         // Only Sara and Tehran survive, not had/coffee/with/in.
         assert_eq!(all_entities(), vec!["sara", "tehran"]);
+    }
+
+    // A relation extractor turns text into directed, typed edges instead of
+    // undirected co-mention: "Joe closed Globex" becomes joe -closed-> globex.
+    #[pg_test]
+    fn relation_extractor_makes_typed_edges() {
+        Spi::run(
+            "CREATE FUNCTION public.caps(doc text) RETURNS text[] LANGUAGE sql AS $$ \
+             SELECT array_agg(lower(w)) \
+             FROM regexp_split_to_table(doc, '[^[:alpha:]]+') AS w \
+             WHERE w ~ '^[[:upper:]]' $$",
+        )
+        .unwrap();
+        Spi::run(
+            "CREATE FUNCTION public.rels(doc text) RETURNS text[] LANGUAGE sql AS $$ \
+             SELECT array_agg(part ORDER BY ord, idx) FROM ( \
+               SELECT row_number() OVER () AS ord, m \
+               FROM regexp_matches(doc, \
+                 '([[:upper:]][[:alpha:]]+) (closed|signed) ([[:upper:]][[:alpha:]]+)', 'g') AS m \
+             ) matches, \
+             LATERAL unnest(ARRAY[lower(m[1]), m[2], lower(m[3])]) WITH ORDINALITY AS u(part, idx) $$",
+        )
+        .unwrap();
+        Spi::run("SET graphwright.extractor = 'public.caps'").unwrap();
+        Spi::run("SET graphwright.relation_extractor = 'public.rels'").unwrap();
+
+        Spi::run("CREATE TABLE notes (id int PRIMARY KEY, owner text, body text)").unwrap();
+        Spi::run("INSERT INTO notes VALUES (1, 'amir', 'Joe closed Globex. Nadia signed Globex.')")
+            .unwrap();
+        Spi::run("CREATE INDEX notes_kg ON notes USING graphwright (body)").unwrap();
+        Spi::run("SELECT graphwright.maintain()").unwrap();
+
+        let edges: Vec<(String, String, String)> = Spi::connect(|client| {
+            let table = client.select(
+                "SELECT src, predicate, dst FROM graphwright.edges('notes') ORDER BY src, dst",
+                None,
+                &[],
+            )?;
+            let mut out = Vec::new();
+            for row in table {
+                out.push((
+                    row.get::<String>(1)?.expect("src"),
+                    row.get::<String>(2)?.expect("predicate"),
+                    row.get::<String>(3)?.expect("dst"),
+                ));
+            }
+            Ok::<_, pgrx::spi::Error>(out)
+        })
+        .unwrap();
+
+        // Directed and typed, and no co_mentioned edges: the relation lane
+        // replaces co-mention when it is set.
+        assert_eq!(
+            edges,
+            vec![
+                (
+                    "joe".to_string(),
+                    "closed".to_string(),
+                    "globex".to_string()
+                ),
+                (
+                    "nadia".to_string(),
+                    "signed".to_string(),
+                    "globex".to_string()
+                ),
+            ]
+        );
     }
 
     // The judge runs after the extractor and can drop mentions before they
