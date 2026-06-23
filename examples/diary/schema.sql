@@ -29,16 +29,29 @@ CREATE POLICY own_diary ON diary
     USING (diarist = current_user) WITH CHECK (diarist = current_user);
 GRANT SELECT, INSERT, UPDATE, DELETE ON diary TO PUBLIC;
 
--- What counts as an entity in a diary is the people (and places) it names.
--- This toy extractor keeps capitalized Latin words and any non-Latin word
--- (so Persian/Cyrillic names survive), dropping lowercase function words. A
--- real app points graphwright.extractor at GLiNER or an LLM instead -- see
--- ../gliner-extractor.sql; the seam is just a SQL function f(text)->text[].
+-- What counts as an entity in a diary is the people it names. This toy
+-- extractor keeps capitalized words and stop-lists the common ones that get
+-- capitalized at the start of a sentence. It is a heuristic and it shows on
+-- real prose -- which is the point of the seam: a real app points
+-- graphwright.extractor at GLiNER or an LLM instead (see ../gliner-extractor.sql
+-- and ./onnx.sql). The seam is just a SQL function f(text) -> text[].
 CREATE OR REPLACE FUNCTION diary_names(doc text) RETURNS text[] LANGUAGE sql IMMUTABLE AS $$
     SELECT array_agg(w)
-    FROM regexp_split_to_table(doc, '[^[:alnum:]]+') AS w
-    WHERE w <> '' AND w !~ '^[a-z]+$'
-      AND lower(w) NOT IN ('i', 'today', 'tonight', 'then', 'this', 'last')
+    FROM regexp_split_to_table(doc, '[^[:alpha:]]+') AS w
+    WHERE w ~ '^[[:upper:]]'
+      AND lower(w) NOT IN (
+        'i','a','an','the','this','that','these','those','here','there',
+        'my','our','your','his','her','its','their','we','you','he','she','it','they',
+        'and','but','or','so','if','then','as','at','by','for','from','in','of','on','to','with',
+        'about','after','before','while','when','where','why','how',
+        'am','is','are','was','were','be','been','have','has','had','do','did','will','would',
+        'could','should','can','may','might','just','not','no','also','still','even','only',
+        'very','really','maybe','another','every','some','any','more','most','all','both',
+        'today','tonight','tomorrow','yesterday','now','later','soon','always','never','often',
+        'busy','quiet','long','good','great','nice','tired','happy','new','old','last','next','early',
+        'monday','tuesday','wednesday','thursday','friday','saturday','sunday',
+        'january','february','march','april','june','july','august','september','october','november','december',
+        'morning','afternoon','evening','night','week','weekend','day','work','office','home','lunch','dinner','coffee')
 $$;
 
 -- Configure the extractor for every session on this database (including the
