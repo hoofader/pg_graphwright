@@ -1436,7 +1436,10 @@ CREATE TABLE graphwright.decision (
     decided_by text NOT NULL DEFAULT current_user,
     decided_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (watch_id, norm_a, norm_b),
-    CHECK (norm_a < norm_b)
+    -- The pair is ordered in Rust by codepoint (byte order for UTF-8); the
+    -- check must use the same order, not the database collation, or a
+    -- cross-script pair like (ali, علی) fails it under a non-C collation.
+    CHECK (norm_a < norm_b COLLATE "C")
 );
 
 CREATE TABLE graphwright.mention (
