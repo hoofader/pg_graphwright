@@ -1554,8 +1554,13 @@ GRANT SELECT ON ALL TABLES IN SCHEMA graphwright TO PUBLIC;
 -- Is source row `pk` visible to the current caller? SECURITY INVOKER, so
 -- the probe runs the source table's row-level security as the caller. This
 -- is the bridge that carries the source's RLS onto the derived graph.
+-- search_path is intentionally NOT pinned: this runs the caller's own
+-- source-table policy, which may reference the caller's unqualified objects
+-- (helper functions, share tables). As an INVOKER function it runs with the
+-- caller's privileges, so a pinned path would buy no safety and would break
+-- legitimate policies. The body itself only touches schema-qualified names.
 CREATE FUNCTION graphwright._pk_visible(wid integer, pk text) RETURNS boolean
-    LANGUAGE plpgsql STABLE SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS $pkv$
+    LANGUAGE plpgsql STABLE SECURITY INVOKER AS $pkv$
 DECLARE
     tbl text;
     col text;
