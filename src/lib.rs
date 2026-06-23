@@ -9,7 +9,7 @@
 // match. No bespoke access-control engine; we delegate to RLS.
 //
 // Extraction is a deterministic stub for now (tokenize a row, co-mention
-// edges); a real LLM/GLiNER seam comes later. That changes how the graph
+// edges); a real LLM/GLiNER extension point comes later. That changes how the graph
 // is filled, not how it is filtered. `CREATE INDEX ... USING graphwright`
 // drives the build through the index access method below.
 
@@ -53,13 +53,13 @@ fn tokenize(text: &str) -> Vec<String> {
 
 // Extract entity surfaces from a document, then pass them through the
 // judge. Both are pluggable SQL functions, so the extension stays model-
-// agnostic, the way graphwright's core treats the LLM as an injected seam.
+// agnostic, the way graphwright's core treats the LLM as an injected extension point.
 // Runs where extraction is scheduled (async, off the writing transaction).
 fn extract(text: &str) -> Vec<String> {
     judge(text, run_extractor(text))
 }
 
-// The extractor seam: graphwright.extractor names a function
+// The extractor extension point: graphwright.extractor names a function
 // `f(text) -> text[]`. Empty means the built-in tokenizer (no model). The
 // host wires in GLiNER via graphwright-onnx, an LLM gateway, a regex NER.
 fn run_extractor(text: &str) -> Vec<String> {
@@ -78,7 +78,7 @@ fn run_extractor(text: &str) -> Vec<String> {
     arr.into_iter().flatten().collect()
 }
 
-// The judge seam: graphwright.judge names a function
+// The judge extension point: graphwright.judge names a function
 // `j(text, text[]) -> text[]`, a larger model that validates or trims the
 // extractor's output before it reaches the graph. AI output is never
 // canon; this is where the bigger model disposes. A judge error or NULL
@@ -117,10 +117,10 @@ fn judge(text: &str, surfaces: Vec<String>) -> Vec<String> {
     }
 }
 
-// The embedding seam: graphwright.embedder names a function
+// The embedding extension point: graphwright.embedder names a function
 // `f(text) -> float8[]`. It embeds each norm and merges pairs whose cosine
 // clears graphwright.embedding_threshold, rescuing short names the lexical
-// gate dropped. Empty seam leaves the deterministic behavior unchanged.
+// gate dropped. Empty extension point leaves the deterministic behavior unchanged.
 fn embed_pairs(norms: &HashSet<String>) -> Vec<(String, String)> {
     let Some(name) = EMBEDDER.get() else {
         return Vec::new();

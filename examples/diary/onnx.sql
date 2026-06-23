@@ -1,6 +1,6 @@
 -- Upgrade the diary from the toy extractor to real NER, with no schema change.
 --
--- The extractor is a seam (graphwright.extractor = a SQL function f(text)->
+-- The extractor is an extension point (graphwright.extractor = a SQL function f(text)->
 -- text[]). This swaps the capitals-regex stand-in for a real GLiNER model,
 -- which finds entities the heuristic misses: lowercase and multi-word names
 -- and places ("old bazaar"), and skips non-entities by meaning, not case.
@@ -40,7 +40,7 @@ SET graphwright.extractor = 'gliner_extract';  -- and this session
 
 -- Re-extract the existing entries through GLiNER. REINDEX re-marks every row;
 -- maintain() then runs them through the new extractor. (New writes need no
--- REINDEX -- aminsert marks them and the next maintain() uses the seam.)
+-- REINDEX -- aminsert marks them and the next maintain() uses the extension point.)
 REINDEX INDEX diary_kg;
 SELECT graphwright.maintain();
 

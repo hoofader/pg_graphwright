@@ -8,7 +8,7 @@ This is the Postgres-native sibling of [graphwright](https://github.com/hoofader
 
 ## Status
 
-Early, but the storage model is now the Postgres-native one. `CREATE INDEX ... USING graphwright (body)` stores each row's extraction in the **index relation's own pages** (WAL-logged through generic WAL, like pg_search), so it is transactional with the heap and travels with physical replication. `aminsert` writes only a tiny marker on a write, and `CREATE INDEX` itself only marks rows; the extractor, judge, and resolved graph build on the next `graphwright.maintain()` (or background-worker) tick, which runs as the extension owner so it sees every row. A slow model never blocks a write. `ambulkdelete` reclaims deleted rows' records on vacuum. The cross-row resolved graph (entities/edges) is derived from index storage into catalog tables that carry **row-level security** so a graph row is visible exactly when the source row(s) behind it are; the accessors and a direct catalog read are filtered the same way. Extraction and judging are pluggable seams (`graphwright.extractor`, `graphwright.judge`), defaulting to a built-in tokenizer and no judge. Resolution folds entity surfaces on a normalized key (Arabic/Persian variants meet), and auto-merges distinctive cross-script phonetic and 3-gram fuzzy matches (both gated by entropy). It never waits: every merge is recorded in a durable, reversible decision log a human edits after the fact (SAGA-style, down to splitting a single mention out of an exact fold), and `graphwright.proposals()` shows the matches the gate left for review. Resolution normalizes through NFKC (so compatibility forms, presentation forms, and ligatures fold), the Arabic/Persian script folds, and diacritic stripping, and carries Latin, Persian, and Cyrillic phonetic schemes. Every content table is under row-level security. The core is in place.
+Early, but the storage model is now the Postgres-native one. `CREATE INDEX ... USING graphwright (body)` stores each row's extraction in the **index relation's own pages** (WAL-logged through generic WAL, like pg_search), so it is transactional with the heap and travels with physical replication. `aminsert` writes only a tiny marker on a write, and `CREATE INDEX` itself only marks rows; the extractor, judge, and resolved graph build on the next `graphwright.maintain()` (or background-worker) tick, which runs as the extension owner so it sees every row. A slow model never blocks a write. `ambulkdelete` reclaims deleted rows' records on vacuum. The cross-row resolved graph (entities/edges) is derived from index storage into catalog tables that carry **row-level security** so a graph row is visible exactly when the source row(s) behind it are; the accessors and a direct catalog read are filtered the same way. Extraction and judging are pluggable extension points (`graphwright.extractor`, `graphwright.judge`), defaulting to a built-in tokenizer and no judge. Resolution folds entity surfaces on a normalized key (Arabic/Persian variants meet), and auto-merges distinctive cross-script phonetic and 3-gram fuzzy matches (both gated by entropy). It never waits: every merge is recorded in a durable, reversible decision log a human edits after the fact (SAGA-style, down to splitting a single mention out of an exact fold), and `graphwright.proposals()` shows the matches the gate left for review. Resolution normalizes through NFKC (so compatibility forms, presentation forms, and ligatures fold), the Arabic/Persian script folds, and diacritic stripping, and carries Latin, Persian, and Cyrillic phonetic schemes. Every content table is under row-level security. The core is in place.
 
 What is already proven is the part nobody else ships: row-derived graph visibility.
 
@@ -83,7 +83,7 @@ There is also a no-index path (`graphwright.watch(table, text_col, pk_col)` + `g
 
 ## Extraction
 
-What counts as an entity is a pluggable seam, so the extension stays model-agnostic (the way graphwright's core treats the LLM as injected). Point `graphwright.extractor` at a SQL function `f(text) -> text[]`; leave it empty for the built-in tokenizer.
+What counts as an entity is a pluggable extension point, so the extension stays model-agnostic (the way graphwright's core treats the LLM as injected). Point `graphwright.extractor` at a SQL function `f(text) -> text[]`; leave it empty for the built-in tokenizer.
 
 ```sql
 -- a toy extractor: capitalized words are entities
@@ -93,9 +93,9 @@ $$;
 SET graphwright.extractor = 'caps';
 ```
 
-The function can wrap anything: a regex NER, an LLM gateway over `pg_net`, or GLiNER through [graphwright-onnx](https://github.com/hoofader/graphwright-onnx). For GLiNER, run its HTTP service and point the seam at it with [`examples/gliner-extractor.sql`](examples/gliner-extractor.sql) (a `pgsql-http` function that POSTs the document and returns the surfaces). It runs asynchronously (the maintenance pass), so a slow model is fine; a write only records a marker.
+The function can wrap anything: a regex NER, an LLM gateway over `pg_net`, or GLiNER through [graphwright-onnx](https://github.com/hoofader/graphwright-onnx). For GLiNER, run its HTTP service and point the extension point at it with [`examples/gliner-extractor.sql`](examples/gliner-extractor.sql) (a `pgsql-http` function that POSTs the document and returns the surfaces). It runs asynchronously (the maintenance pass), so a slow model is fine; a write only records a marker.
 
-A second seam validates the result. `graphwright.judge` names a function `j(text, text[]) -> text[]` (a larger model) that trims or vets the extractor's mentions before they reach the graph:
+A second extension point validates the result. `graphwright.judge` names a function `j(text, text[]) -> text[]` (a larger model) that trims or vets the extractor's mentions before they reach the graph:
 
 ```sql
 CREATE FUNCTION vet(doc text, mentions text[]) RETURNS text[] LANGUAGE sql AS $$
@@ -116,7 +116,7 @@ Beyond exact, two lanes auto-merge when the name is distinctive enough (an entro
 SELECT * FROM graphwright.proposals('notes');  -- gated-out candidates to review
 ```
 
-When `graphwright.embedder` (a `f(text) -> float8[]` seam) is set, an **embedding match** auto-merges names whose vectors clear `graphwright.embedding_threshold` (default `0.83`). This is the semantic lane: it reaches short names the entropy gate keeps out of the lexical lanes, so `Ali` / `علی` can merge on meaning.
+When `graphwright.embedder` (a `f(text) -> float8[]` extension point) is set, an **embedding match** auto-merges names whose vectors clear `graphwright.embedding_threshold` (default `0.83`). This is the semantic lane: it reaches short names the entropy gate keeps out of the lexical lanes, so `Ali` / `علی` can merge on meaning.
 
 ### Reviewing decisions
 

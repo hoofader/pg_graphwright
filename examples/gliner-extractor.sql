@@ -1,4 +1,4 @@
--- Wire pg_graphwright's extractor seam to a graphwright-onnx model service.
+-- Wire pg_graphwright's extractor extension point to a graphwright-onnx model service.
 --
 -- The extension keeps the model runtime OUT of the backend: extraction is a
 -- SQL function f(text) -> text[]. Here that function calls a small HTTP
@@ -33,7 +33,7 @@ CREATE OR REPLACE FUNCTION gliner_extract(doc text) RETURNS text[]
     );
 $$;
 
--- Point the seam at it. (A judge can vet the result too: graphwright.judge.)
+-- Point the extension point at it. (A judge can vet the result too: graphwright.judge.)
 SET graphwright.extractor = 'gliner_extract';
 
 -- No pgsql-http? The same call works from plpython3u with urllib, or wire any

@@ -499,7 +499,7 @@ pub fn gated_fuzzy_pairs(norms: &HashSet<String>) -> Vec<(String, String)> {
 //
 // The semantic rescue lane: it merges names the lexical gate dropped
 // (short, low-entropy) when their vectors are close. Vectors come from
-// the graphwright.embedder seam; this is the pure scoring half. Not
+// the graphwright.embedder extension point; this is the pure scoring half. Not
 // entropy-gated, on purpose — rescuing short names is the whole point.
 
 fn cosine(a: &[f64], b: &[f64]) -> f64 {

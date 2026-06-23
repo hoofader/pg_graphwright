@@ -26,7 +26,7 @@ CREATE ROLE arman;
 
 -- A toy extractor: capitalized words that are not common sentence-starters.
 -- Real deployments point graphwright.extractor at GLiNER or an LLM (see
--- examples/gliner-extractor.sql); the seam is just a SQL function f(text)->text[].
+-- examples/gliner-extractor.sql); the extension point is just a SQL function f(text)->text[].
 CREATE OR REPLACE FUNCTION names_only(doc text) RETURNS text[] LANGUAGE sql IMMUTABLE AS $$
   SELECT array_agg(w)
   FROM regexp_split_to_table(doc, '[^[:alpha:]]+') AS w

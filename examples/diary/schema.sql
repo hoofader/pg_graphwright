@@ -1,7 +1,7 @@
 -- A personal diary, with pg_graphwright as the knowledge-graph backend.
 --
 -- This is the reusable schema: the table, its row-level security, the
--- extraction seam, the graph index, and an app-facing API of per-diarist
+-- extraction extension point, the graph index, and an app-facing API of per-diarist
 -- views. Run it once, then examples/diary/demo.sql for the walkthrough.
 --
 --   psql -f examples/diary/schema.sql
@@ -32,9 +32,9 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON diary TO PUBLIC;
 -- What counts as an entity in a diary is the people it names. This toy
 -- extractor keeps capitalized words and stop-lists the common ones that get
 -- capitalized at the start of a sentence. It is a heuristic and it shows on
--- real prose -- which is the point of the seam: a real app points
+-- real prose -- which is the point of the extension point: a real app points
 -- graphwright.extractor at GLiNER or an LLM instead (see ../gliner-extractor.sql
--- and ./onnx.sql). The seam is just a SQL function f(text) -> text[].
+-- and ./onnx.sql). The extension point is just a SQL function f(text) -> text[].
 CREATE OR REPLACE FUNCTION diary_names(doc text) RETURNS text[] LANGUAGE sql IMMUTABLE AS $$
     SELECT array_agg(w)
     FROM regexp_split_to_table(doc, '[^[:alpha:]]+') AS w
