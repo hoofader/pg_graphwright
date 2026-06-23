@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep in lockstep with the `pgrx` pin in Cargo.toml.
+  PGRX_VERSION: "0.18.0"
+
+jobs:
+  test:
+    name: fmt + clippy + pgrx test (pg17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      # pgrx builds Postgres from source into ~/.pgrx (user-owned), so the
+      # extension installs and the test cluster runs without root. These are
+      # the deps that build needs.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bison flex libreadline-dev zlib1g-dev \
+            libssl-dev libicu-dev pkg-config libclang-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache the cargo-pgrx binary
+        id: pgrx-bin
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-pgrx
+          key: cargo-pgrx-${{ env.PGRX_VERSION }}-${{ runner.os }}
+
+      - name: Install cargo-pgrx
+        if: steps.pgrx-bin.outputs.cache-hit != 'true'
+        run: cargo install cargo-pgrx --version ${{ env.PGRX_VERSION }} --locked
+
+      - name: Cache the pgrx-managed Postgres
+        uses: actions/cache@v4
+        with:
+          path: ~/.pgrx
+          key: pgrx-${{ env.PGRX_VERSION }}-pg17-${{ runner.os }}
+
+      # Builds Postgres 17 on a cache miss; detects and reuses it on a hit.
+      - name: Initialize pgrx
+        run: cargo pgrx init --pg17 download
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --no-default-features --features pg17 --tests -- -D warnings
+
+      - name: Test
+        run: cargo pgrx test pg17

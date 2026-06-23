@@ -245,8 +245,9 @@ fn cyrillic_class(ch: char) -> Option<Vec<&'static str>> {
         // Ambiguous glide.
         'й' => &["y", ""],
         // Vowels and the soft/hard signs contribute nothing.
-        'а' | 'о' | 'у' | 'ы' | 'э' | 'и' | 'е' | 'ё' | 'я' | 'ю' | 'і' | 'ї' | 'є' | 'ь'
-        | 'ъ' => &[""],
+        'а' | 'о' | 'у' | 'ы' | 'э' | 'и' | 'е' | 'ё' | 'я' | 'ю' | 'і' | 'ї' | 'є' | 'ь' | 'ъ' => {
+            &[""]
+        }
         _ => return None,
     };
     Some(c.to_vec())

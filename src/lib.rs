@@ -23,6 +23,9 @@ use resolve::{
 };
 use std::collections::HashSet;
 
+// Two normalized names, ordered (norm_a <= norm_b): a merge/split decision.
+type NormPair = (String, String);
+
 fn lit(s: &str) -> String {
     pgrx::spi::quote_literal(s)
 }
@@ -263,7 +266,7 @@ fn resolve_from_storage(indexrel: pg_sys::Relation, watch_id: i32) {
 }
 
 // Read a watch's durable decisions as sorted norm pairs: (merges, splits).
-fn read_decisions(watch_id: i32) -> (Vec<(String, String)>, Vec<(String, String)>) {
+fn read_decisions(watch_id: i32) -> (Vec<NormPair>, Vec<NormPair>) {
     use pgrx::Spi;
     let rows: Vec<(String, String, String)> = Spi::connect(|client| {
         let table = client.select(
@@ -1078,6 +1081,7 @@ pub unsafe extern "C-unwind" fn ambuildempty(_indexrel: pg_sys::Relation) {}
 // transaction). The extractor and the resolved graph catch up on the next
 // maintain(), so a slow model never blocks the write.
 #[pg_guard]
+#[allow(clippy::too_many_arguments)] // the aminsert callback signature is fixed by Postgres
 pub unsafe extern "C-unwind" fn aminsert(
     indexrel: pg_sys::Relation,
     _values: *mut pg_sys::Datum,
@@ -1138,6 +1142,7 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
 // No scans are served (amgettuple/amgetbitmap are None), so price the AM
 // out of any scan path.
 #[pg_guard]
+#[allow(clippy::too_many_arguments)] // the amcostestimate callback signature is fixed by Postgres
 pub unsafe extern "C-unwind" fn amcostestimate(
     _root: *mut pg_sys::PlannerInfo,
     _path: *mut pg_sys::IndexPath,
