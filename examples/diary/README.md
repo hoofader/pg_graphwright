@@ -33,12 +33,38 @@ extractor setting is in effect.
 ## The files
 
 - `schema.sql` — the diary table + its policy, the extraction seam
-  (`graphwright.extractor` = a toy `diary_names`; swap in GLiNER via
-  `../gliner-extractor.sql`), the `USING graphwright` index, and the
-  `security_invoker` app views.
+  (`graphwright.extractor` = a toy `diary_names`), the `USING graphwright`
+  index, and the `security_invoker` app views.
 - `demo.sql` — creates two diarists, writes their entries, builds the graph,
   and walks privacy, the review/merge handoff, a live edit, and a
   most-connected-people query.
+- `onnx.sql` — swaps the toy extractor for a real GLiNER model, with no
+  schema change.
+
+## Real NER (`onnx.sql`)
+
+The capitals extractor is a stand-in. Because extraction is a seam, you swap
+in a real model by pointing `graphwright.extractor` at a different SQL
+function — no schema change, no re-architecting. `onnx.sql` points it at the
+[graphwright-onnx](https://github.com/hoofader/graphwright-onnx) GLiNER
+service (over `pgsql-http`) and re-extracts.
+
+The difference is real. On *"met Darya near the old bazaar in tehran"*:
+
+| extractor | entities found |
+|-----------|----------------|
+| toy capitals regex | `Darya` |
+| GLiNER (ONNX) | `Darya`, `old bazaar`, `tehran` |
+
+The model recovers a lowercase, multi-word *place* the heuristic can't see,
+and skips non-entities (`coffee`, `morning`) by meaning rather than case. The
+model runs in its own process, not the database backend; Postgres only POSTs
+the text and gets back surfaces. Verified end to end.
+
+The small English model (`gliner_small-v2.1`) under-extracts non-Latin
+scripts — it skips the Persian `سارا`. That is a model choice, not a wiring
+one: point `GRAPHWRIGHT_ONNX_MODEL_ID` at a multilingual GLiNER model for
+Persian/Cyrillic. The seam is the same either way.
 
 ## Honest scope
 
