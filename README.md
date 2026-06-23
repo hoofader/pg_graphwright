@@ -151,4 +151,4 @@ Requires the pgrx toolchain (`cargo install cargo-pgrx`, then `cargo pgrx init`)
 
 ## License
 
-AGPL-3.0-only. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
