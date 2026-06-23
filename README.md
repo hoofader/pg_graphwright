@@ -36,6 +36,8 @@ SELECT * FROM graphwright.edges('notes');
 
 `graphwright.watch(table, text_col, pk_col)` + `graphwright.reindex(id)` are also exposed for building the graph without an index (with a primary-key column as provenance instead of `ctid`).
 
+Runnable, self-contained demos are in [`examples/`](examples/): row-level-security-derived visibility, `union` vs `intersection` edge disclosure, and cross-script resolution with reversible review.
+
 ## Edge visibility
 
 An edge can be supported by more than one source row. Two rules, set per watch (default `union`):
